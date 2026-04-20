@@ -116,16 +116,16 @@ const wasmBytes = new Uint8Array([
     }
 
     if (allOk) {
-      status.textContent = "ok — JIT pipeline functional";
+      status.textContent = "ok - JIT pipeline functional";
       status.className   = "ok";
       log("PIPELINE OK", "ok");
     } else {
-      status.textContent = "FAIL — execution mismatch";
+      status.textContent = "FAIL - execution mismatch";
       status.className   = "bad";
       log("PIPELINE FAILED", "bad");
     }
   } catch (e) {
-    status.textContent = "FAIL — " + e.message;
+    status.textContent = "FAIL - " + e.message;
     status.className   = "bad";
     log("error: " + e.message, "bad");
     log(e.stack || "");

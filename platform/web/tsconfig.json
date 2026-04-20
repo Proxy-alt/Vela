@@ -1,0 +1,39 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2022", "DOM", "DOM.Iterable", "WebWorker"],
+    "types": ["@webgpu/types"],
+    "jsx": "preserve",
+    "jsxImportSource": "solid-js",
+
+    "strict": true,
+    "noImplicitAny": true,
+    "noImplicitReturns": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "exactOptionalPropertyTypes": true,
+
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "isolatedModules": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "allowSyntheticDefaultImports": true,
+
+    "paths": {
+      "@/*":         ["./src/*"],
+      "@bindings/*": ["./bindings/*"],
+      "@workers/*":  ["./workers/*"]
+    }
+  },
+  "include": [
+    "src/**/*",
+    "bindings/**/*",
+    "workers/**/*",
+    "shared-workers/**/*",
+    "sw.ts"
+  ]
+}

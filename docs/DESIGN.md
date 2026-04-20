@@ -433,20 +433,26 @@ Audio Worker
   - feeds AudioWorkletProcessor
   - AudioWorklet outputs to system audio
 
-JIT compilation path (when Ballistic WASM backend is active)
-  CPU Worker encounters untranslated ARM block at guest address X
-  - runs block through interpreter (slow path, immediately)
-  - simultaneously posts { address: X, armBytes: Uint8Array } to Compiler Shared Worker
-  Compiler Shared Worker:
-  - checks memory cache: return cached module if hit
-  - checks OPFS cache: return cached module if hit
-  - WebAssembly.compile(wasmBytes), async
-  - caches compiled WebAssembly.Module
-  - posts { address: X, module: WebAssembly.Module } back to CPU Worker
-  CPU Worker:
-  - WebAssembly.instantiate(module, { env: { memory: guestRAM, ... } })
-  - stores compiled entry point in block cache at address X
-  - next execution of X takes compiled fast path
+### JIT compilation path (Ballistic WASM backend)
+
+CPU Worker encounters untranslated ARM block at guest address X
+  - runs block through interpreter (slow path, immediate)
+  - ARM decoder produces Ballistic IR (flat instruction array, strict SSA,
+    scope-based control flow)
+  - WASM backend walks IR instruction array via cursor (Rule 2, no index math)
+  - static inline emit functions fold into translation loop (no indirect dispatch)
+  - emit produces complete WASM module bytes in output buffer
+  - bytes posted to Compiler Shared Worker via platform callback
+
+Compiler Shared Worker
+  - WebAssembly.compile(bytes)
+  - caches WebAssembly.Module by guest address in memory and OPFS
+  - posts module back to CPU Worker
+
+CPU Worker
+  - WebAssembly.instantiate(module, { env: { memory, read_reg, write_reg, call_hle } })
+  - caches instance.exports.entry by guest address
+  - subsequent executions call entry directly (fast path)
 ```
 
 ---
@@ -714,9 +720,19 @@ Ballistic (github.com/pound-emu/ballistic) is a C rewrite of the dynarmic ARM re
 
 **Current status (April 2026):** Implementing basic arithmetic instructions. IR layer in design phase.
 
-### Critical IR requirements for WASM backend
+### IR requirements - status
 
-These three requirements must be established before the IR solidifies. Raise them on the Pound Discord before contributing code.
+| Requirement | Status | Notes |
+|---|---|---|
+| CFG preserved to backend | ✓ Confirmed | Scope-based IR, no jumps |
+| SSA value numbering | ✓ Confirmed | Strict SSA, implicit indexing |
+| Backend vtable | Resolved differently | Compile-time via static inline headers |
+
+The backend interface question resolved differently than originally designed.
+GloriousTacoo's D-cache constraint makes function pointer dispatch in the
+translation loop unacceptable. The compile-time macro/inline approach satisfies
+both the performance constraint and the multi-backend requirement - each
+backend is a header of static inline functions selected at compile time.
 
 **Requirement 1, CFG must be preserved to the backend**
 
@@ -880,6 +896,120 @@ Most Switch game ARM code has reducible CFGs (single-entry loops). Irreducible C
 Reference implementation: Emscripten Relooper (github.com/emscripten-core/emscripten/blob/main/tools/relooper)
 
 ---
+
+## 7b. Ballistic WASM Backend Architecture
+
+### Compile-time backend selection
+
+The WASM backend follows Ballistic's D-cache performance philosophy exactly.
+No function pointers in the translation loop. Backend selection is a compile-time
+decision - the correct emit functions are included as static inline headers and
+folded into the translation loop by the compiler.
+
+cmake -DCPU_BACKEND=ballistic-wasm ..   # web target
+cmake -DCPU_BACKEND=ballistic-x86  ..   # desktop target
+
+### File structure
+
+backend/
+  wasm/
+    emit.h      ← static inline emit functions, included at compile time
+    emit.c      ← LEB128 encoding, buffer growth (too branchy to inline)
+    module.h    ← WASM module builder interface
+    module.c    ← header, section, finalise (called once per block, not hot)
+  x86/
+    emit.h      ← same pattern, x86 opcodes
+
+### IR - WASM opcode mapping
+
+The Ballistic IR uses scope-based structured control flow. This maps
+almost 1:1 to WASM's block/loop/if model with no Relooper required.
+
+| Ballistic IR       | WASM emission                          |
+|--------------------|----------------------------------------|
+| OPCODE_IF          | if (void type) + depth push            |
+| OPCODE_LOOP        | loop (void type) + depth push          |
+| OPCODE_BREAK       | br depth_to_enclosing_block            |
+| OPCODE_CONTINUE    | br depth_to_loop_header                |
+| OPCODE_MERGE       | end + local.set merged SSA local       |
+| OPCODE_END_BLOCK   | end                                    |
+| OPCODE_YIELD       | local.get - pushes value for MERGE     |
+| OPCODE_ADD         | local.get src1, local.get src2, i64.add, local.set dst |
+| OPCODE_LOAD        | local.get addr, i64.load 3 0           |
+| OPCODE_STORE       | local.get addr, local.get src, i64.store 3 0 |
+| OPCODE_CONST       | i64.const from constant_pool[idx]      |
+| OPCODE_RETURN      | return                                 |
+| OPCODE_NOP         | nop (or skip entirely)                 |
+
+### SSA - WASM locals
+
+Strict SSA maps directly to WASM locals via implicit indexing:
+
+    ssa_index N - wasm local N
+
+No register allocator needed. The WASM function declares
+instruction_count locals at the top - types derived from ssa_bit_widths[].
+A pre-scan of the IR block before emission determines the local count.
+
+### Constant operands
+
+When Bit[16] of an operand is set it is a constant pool index not an SSA index:
+
+    if (operand & (1u << 16)) {
+        // emit i64.const constant_pool[operand & 0xFFFF]
+    } else {
+        // emit local.get operand
+    }
+
+### Extension instructions
+
+OPCODE_ARG_EXTENSION must be physically contiguous to its parent instruction.
+The emission loop looks ahead when it encounters an extension instruction and
+collects all arguments before emitting anything for the parent.
+
+### WASM module structure per compiled block
+
+Each compiled ARM block becomes one WASM module with a fixed layout:
+
+    magic + version
+    type section    - one function type: () - void
+    import section  - memory, read_reg, write_reg, call_hle
+    function section
+    export section  - "entry" function 0
+    code section    - locals declaration + translated body
+
+The entry export is the only export. The CPU Worker caches it by guest
+address and calls it directly on subsequent executions.
+
+### The platform callback
+
+wasm_module_finalise() hands the completed bytes to a platform-provided
+callback. The backend does not know or care what happens to the bytes:
+
+    typedef void (*wasm_compile_callback_t)(
+        uint64_t       guest_address,
+        const uint8_t* wasm_bytes,
+        size_t         byte_count,
+        void*          userdata
+    );
+
+Web:     posts bytes to Compiler Shared Worker - WebAssembly.compile()
+Desktop: passes to Wasmtime or stub
+Xbox:    passes to UWP WASM runtime
+
+### Scope depth tracking
+
+The emission loop maintains a parallel scope stack alongside Ballistic's
+block_scope_stack[]. Each frame tracks the WASM block nesting depth at
+entry so BREAK and CONTINUE emit br instructions with correct depth indices:
+
+    typedef struct {
+        uint32_t wasm_depth;
+        uint32_t scope_type;   // IF or LOOP
+        uint32_t yield_local;  // WASM local where MERGE result lands
+    } WasmScopeFrame;
+
+    WasmScopeFrame wasm_scope_stack[64]; // matches block_scope_stack depth limit
 
 ## 8. HLE Service Layer
 
@@ -2119,7 +2249,7 @@ endif()
 - [ ] Load executable sections into guest memory
 - [ ] Memory HLE (SetHeapSize, MapMemory, basic virtual memory)
 - [ ] Minimal IPC + sm: service stub
-- [ ] Basic input (Gamepad API → CPU worker)
+- [ ] Basic input (Gamepad API - CPU worker)
 - [ ] Entry point execution attempt
 
 ---

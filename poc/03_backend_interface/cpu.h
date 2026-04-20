@@ -1,10 +1,10 @@
 /*
- * cpu.h — abstract CPU backend vtable.
+ * cpu.h - abstract CPU backend vtable.
  *
  * Every recompiler/interpreter behind this interface is interchangeable.
  * Nothing outside the backend implementations knows or cares which
  * backend is active. Ballistic plugs in by supplying one CPU_Backend
- * instance — exactly the same shape as the dynarmic and noop backends.
+ * instance - exactly the same shape as the dynarmic and noop backends.
  *
  * This is the production interface (lifted verbatim from DESIGN.MD §5)
  * not a POC sketch. It is what dynarmic_backend.c implements today and
@@ -78,7 +78,7 @@ extern "C"
         void (*halt)(CPU_State *state);
         bool (*is_halted)(CPU_State *state);
 
-        /* code cache management — call after writing to guest RAM
+        /* code cache management - call after writing to guest RAM
          * (self-modifying code, JIT patching, page remap) */
         void (*invalidate_cache)(CPU_State *state, uint64_t guest_address, uint64_t size_bytes);
         void (*clear_cache)(CPU_State *state);
@@ -95,7 +95,7 @@ extern "C"
         bool supports_wasm; /* true only for ballistic when WASM target enabled */
     };
 
-/* Register index reference — Switch ABI / ARM AAPCS64 */
+/* Register index reference - Switch ABI / ARM AAPCS64 */
 #define CPU_REG_X0 0
 #define CPU_REG_X8 8   /* syscall number */
 #define CPU_REG_X29 29 /* frame pointer */

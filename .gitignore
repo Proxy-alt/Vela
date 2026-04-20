@@ -1,2 +1,31 @@
-build
+# Build
+build/
+build-*/
+out/
+cmake-build-*/
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.wasm
+*.wasm.map
+
+# Generated
 actual_output.txt
+compile_commands.json
+
+# Editor / IDE
+.idea/
+*.swp
+*.swo
+.cache/
+
+# Node / web
+node_modules/
+dist/
+.vite/
+
+# OS
+.DS_Store
+Thumbs.db

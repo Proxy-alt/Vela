@@ -1,5 +1,5 @@
 /*
- * ballistic_stub.c — the exact surface Ballistic has to fill in.
+ * ballistic_stub.c - the exact surface Ballistic has to fill in.
  *
  * This compiles. It links. It is structurally identical to
  * dynarmic_backend.c. Every function is a stub that does nothing useful;
@@ -28,7 +28,7 @@ typedef struct
 
     /* Mirror minimal arch state so the stub can be exercised end-to-end
      * without a real backend. Ballistic will own the real register file
-     * inside its packed JIT-state struct (≤64 bytes — see DESIGN.MD §7). */
+     * inside its packed JIT-state struct (≤64 bytes - see DESIGN.MD §7). */
     uint64_t x[31];
     uint64_t pc;
     uint64_t sp;
@@ -75,7 +75,7 @@ static void b_run(CPU_State *state, uint64_t entry_point)
     BalState *s = (BalState *)state;
     s->pc = entry_point;
     fprintf(stderr,
-            "[ballistic-stub] run(pc=0x%016llx) — backend not implemented\n",
+            "[ballistic-stub] run(pc=0x%016llx) - backend not implemented\n",
             (unsigned long long)entry_point);
 }
 
@@ -116,14 +116,14 @@ static void b_set_pstate(CPU_State *s, uint32_t v) { ((BalState *)s)->pstate = v
 
 static uint64_t b_get_sys_reg(CPU_State *s, uint32_t r)
 {
-    /* TODO(Ballistic): MRS — decode `r` (op0/op1/CRn/CRm/op2). */
+    /* TODO(Ballistic): MRS - decode `r` (op0/op1/CRn/CRm/op2). */
     (void)s;
     (void)r;
     return 0;
 }
 static void b_set_sys_reg(CPU_State *s, uint32_t r, uint64_t v)
 {
-    /* TODO(Ballistic): MSR — same decode as get_sys_reg. */
+    /* TODO(Ballistic): MSR - same decode as get_sys_reg. */
     (void)s;
     (void)r;
     (void)v;

@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Vela</title>
+    <link rel="manifest" href="/site.webmanifest" />
+    <meta name="theme-color" content="#000000" />
+    <style>
+      :root { color-scheme: dark; font-family: ui-sans-serif, system-ui, sans-serif; }
+      html, body { margin: 0; padding: 0; background: #000; color: #e6e6ea; height: 100%; overflow: hidden; }
+      #boot {
+        position: fixed; inset: 0; background: #000; display: flex; justify-content: flex-end;
+        pointer-events: none; z-index: 10;
+      }
+      #boot-log {
+        width: 420px; max-width: 40vw; height: 100%; padding: 16px 18px; box-sizing: border-box;
+        overflow-y: auto; overflow-x: hidden;
+        font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+        white-space: pre-wrap; word-break: break-word;
+        border-left: 1px solid #161620; background: rgba(0,0,0,0.6);
+        pointer-events: auto;
+      }
+      #boot-log .log-line  { margin: 0; }
+      #boot-log .log-info  { color: #c8d5ff; }
+      #boot-log .log-warn  { color: #f3c27d; }
+      #boot-log .log-error { color: #ff8b8b; }
+      #boot-log .log-debug { color: #8d8d99; }
+      #boot-log .log-trace { color: #5a5a66; }
+      #boot.fade-out { opacity: 0; transition: opacity 240ms ease; }
+      #app-root { position: fixed; inset: 0; }
+    </style>
+  </head>
+  <body>
+    <div id="app-root"></div>
+    <div id="boot" aria-live="polite">
+      <div id="boot-log"></div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

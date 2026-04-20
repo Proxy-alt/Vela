@@ -4,7 +4,7 @@ This is a pitch, not a fork request. Three small artifacts demonstrating
 that a Switch emulator core has already been designed around a
 recompiler-shaped hole, that the hole fits Ballistic exactly, and that
 the WASM backend you'll need to ship to be the primary recompiler for
-that emulator is a finite, scoped piece of work — not a research
+that emulator is a finite, scoped piece of work - not a research
 project.
 
 Read in order:
@@ -27,14 +27,14 @@ work). dynarmic is wired in as the interim desktop recompiler.
 
 The vtable is [poc/03_backend_interface/cpu.h](03_backend_interface/cpu.h).
 That is the entire surface the rest of the core sees. HLE, GPU, audio,
-loader — none of them know which backend is active.
+loader - none of them know which backend is active.
 
 ---
 
 ## 2. What is wrong with dynarmic, with numbers
 
 [poc/01_dynarmic_bottlenecks/bench.cpp](01_dynarmic_bottlenecks/bench.cpp)
-is a synthetic benchmark — no ROM, no HLE, no game, just a 16-ADD
+is a synthetic benchmark - no ROM, no HLE, no game, just a 16-ADD
 hot block fed to `Dynarmic::A64::Jit::Run()` in a tight loop with
 profiling around it. Captured output is in
 [sample_output.txt](01_dynarmic_bottlenecks/sample_output.txt);
@@ -60,7 +60,7 @@ Per the project design doc (§7), Ballistic targets exactly these:
 | dynarmic cost            | Ballistic design choice that removes it                          |
 |--------------------------|------------------------------------------------------------------|
 | 4 cache lines / Run      | JIT state packed within a single 64 B line                       |
-| 54 cycle entry tax       | C, no virtual dispatch, base+index addressing — no 8 B pointer loads on the dispatcher's hot path |
+| 54 cycle entry tax       | C, no virtual dispatch, base+index addressing - no 8 B pointer loads on the dispatcher's hot path |
 | 118x eviction slowdown   | dense array + index linked lists for blocks; invalidation is O(touched), not O(all) |
 
 The peephole pass and correct XMM/SIMD spilling are bonus wins not
@@ -88,7 +88,7 @@ backend-selection table is a one-line change. Nothing else moves.
 
 These exist because of a single downstream constraint: a WASM backend.
 [poc/02_wasm_pipeline/index.html](02_wasm_pipeline/index.html) is a
-self-contained page — no build, no deps — that hand-emits a WASM
+self-contained page - no build, no deps - that hand-emits a WASM
 module representing one ARM `ADD`, hands it to
 `WebAssembly.compile()`, instantiates it, calls it. Open in Chrome,
 look at the console. That same byte stream is what the Ballistic WASM
@@ -126,4 +126,4 @@ The Pound Discord questions, exactly:
 
 If the answers are *yes / SSA / vtable*, the WASM backend is a
 straightforward project. If any answer is *no*, fixing it later means
-restructuring the compilation pipeline — much cheaper to settle now.
+restructuring the compilation pipeline - much cheaper to settle now.

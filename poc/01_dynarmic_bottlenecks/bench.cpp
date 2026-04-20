@@ -34,7 +34,7 @@ namespace
     // 16 ARM64 ADD instructions followed by a RET. This is the hot block the
     // JIT will translate once and execute OUTER_ITERS times. The loop is
     // driven from the host side (Run() -> RET -> Run() -> ...) so the host
-    // pays the prologue / epilogue cost on every iteration — exactly the
+    // pays the prologue / epilogue cost on every iteration - exactly the
     // cost we want to measure.
     //
     //   ADD X0, X0, #1     0x91000400
@@ -163,7 +163,7 @@ int main()
     for (int i = 0; i < 31; ++i)
         jit.SetRegister(i, 0);
     env.ticks_left = 1;
-    jit.Run(); // warm the block cache — first run compiles
+    jit.Run(); // warm the block cache - first run compiles
     env.blocks_executed = 0;
 
     const std::uint64_t t0 = rdtsc();

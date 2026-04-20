@@ -4,13 +4,13 @@ project(dynarmic_bench CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Disable vcpkg if it was set in the environment — all deps are vendored
+# Disable vcpkg if it was set in the environment - all deps are vendored
 # inside dynarmic's own externals/ directory, vcpkg only causes conflicts
 set(CMAKE_TOOLCHAIN_FILE "" CACHE STRING "" FORCE)
 
 #  Dynarmic (vendored submodule)
 # Point this at wherever you cloned dynarmic.
-# Default assumes: switchEmu/externals/dynarmic
+# Default assumes: Vela/externals/dynarmic
 set(DYNARMIC_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../externals/dynarmic"
     CACHE PATH "Path to dynarmic source root")
 

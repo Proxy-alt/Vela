@@ -1,0 +1,22 @@
+{
+  "name": "switch-emu-web",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "description": "Web platform layer for the Vela C core. WASM-first.",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "solid-js": "^1.8.0"
+  },
+  "devDependencies": {
+    "@webgpu/types": "^0.1.69",
+    "typescript": "^5.4.0",
+    "vite": "^5.2.0",
+    "vite-plugin-solid": "^2.10.0"
+  }
+}

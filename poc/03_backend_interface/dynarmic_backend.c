@@ -1,5 +1,5 @@
 /*
- * dynarmic_backend.c — wires the dynarmic recompiler into CPU_Backend.
+ * dynarmic_backend.c - wires the dynarmic recompiler into CPU_Backend.
  *
  * dynarmic is C++. The actual class instantiation (Dynarmic::A64::Jit,
  * Dynarmic::A64::UserConfig, the UserCallbacks subclass) lives in a
@@ -11,7 +11,7 @@
  *
  * What this file demonstrates for the Ballistic side: the surface to
  * implement is small. Everything fits in one screen. Replace `dyn_*`
- * with `bal_*` and you are done — that is exactly what
+ * with `bal_*` and you are done - that is exactly what
  * ballistic_stub.c does in this same directory.
  */
 

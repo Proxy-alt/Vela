@@ -1,0 +1,11 @@
+{
+  "tools": {
+    "cmake":      ">=3.24",
+    "ninja":      ">=1.11",
+    "clang":      ">=16",
+    "emscripten": ">=3.1.60",
+    "node":       ">=20",
+    "pnpm":       ">=9"
+  },
+  "notes": "Minimum tool versions required to build Vela. Core is C11 strict."
+}
