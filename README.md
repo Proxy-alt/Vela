@@ -22,7 +22,7 @@ Native apps on iOS, Android, macOS, tvOS, Windows, Linux, and Xbox share the sam
 
 To play games you must provide:
 
-- **prod.keys** - cryptographic keys dumped from your own Nintendo Switch using [Lockpick_RCM](https://github.com/shchmue/Lockpick_RCM)
+- **prod.keys** - cryptographic keys dumped from your own Nintendo Switch using [Lockpick_RCM](https://github.com/s1204IT/Lockpick_RCM)
 - **Game files** - NSP or XCI files dumped from cartridges or digital purchases you own
 
 Vela does not and will never distribute keys, firmware, or game files. These must come from hardware you own. See the [dumping guide](docs/DUMPING.md) for instructions.
@@ -174,7 +174,7 @@ These are studied as reference, not forked:
 | [Ryubing](https://github.com/Ryubing) | HLE service implementations |
 | yuzu (archived) | GPU emulation approach |
 | dynarmic | ARM instruction semantics and test cases |
-| [Emscripten Relooper](https://github.com/emscripten-core/emscripten/blob/main/tools/relooper) | CFG → structured control flow |
+| [Emscripten Relooper](https://github.com/WebAssembly/binaryen/blob/main/src/cfg/Relooper.h) | CFG → structured control flow |
 
 ---
 
