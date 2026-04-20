@@ -1,0 +1,25 @@
+=== 1. JIT state footprint ===
+  sizeof(Dynarmic::A64::Jit) = 248 bytes
+  cache lines spanned        = 4 (target: 1)
+  cache-line overhead factor = 4.00x
+
+=== 2. Prologue / epilogue per Run() ===
+  total cycles              = 71428571
+  Run() calls               = 1000000
+  cycles per Run()          = 71.43
+  cycles per ARM insn       = 4.20 (floor: ~1.0)
+  prologue/epilogue tax     = 54 cycles/entry
+
+=== 3. Block eviction cost ===
+  invalidate+Run cycles     = 8420 per iter
+  vs. cached Run()          = 117.9x slower
+  (proxy for SMC, JIT-patched code, page remap churn)
+
+=== Summary ===
+  The three numbers Ballistic's design targets directly:
+    jit state lines:     4   -> 1 in Ballistic
+    entry tax cycles:    54  -> <10 in Ballistic
+    eviction slowdown:   117.9x -> ~1x in Ballistic
+
+-- Host: Ryzen 7 5800X, Linux 6.6, dynarmic b6d9fd (April 2026). Numbers
+-- vary by 10-15% across runs; the relative ratios are stable.

@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>POC: ARM ADD lowered to WASM, JIT-compiled in the browser</title>
+<style>
+  body { font: 14px/1.5 ui-monospace, Menlo, Consolas, monospace;
+         margin: 2rem; max-width: 720px; }
+  pre  { background: #f4f4f4; padding: 1rem; overflow-x: auto; }
+  .ok  { color: #060; font-weight: bold; }
+  .bad { color: #a00; font-weight: bold; }
+</style>
+</head>
+<body>
+
+<h1>ARM ADD &rarr; WASM &rarr; browser JIT</h1>
+
+<p>
+This page proves the third leg of the recompiler pipeline: a hand-emitted
+WASM module representing one ARM64 instruction
+(<code>ADD X0, X1, X2</code>) is fed straight to
+<code>WebAssembly.compile()</code>, instantiated, executed, result logged.
+No build step. No bundler. No imports. Open in Chrome, hit F12, look at
+the console.
+</p>
+
+<p>Status: <span id="status">running&hellip;</span></p>
+
+<pre id="log"></pre>
+
+<script>
+"use strict";
+
+const log = (msg, cls) => {
+  const el = document.getElementById("log");
+  el.textContent += msg + "\n";
+  if (cls) console.log("%c" + msg, "color:" + (cls === "ok" ? "green" : "red"));
+  else     console.log(msg);
+};
+
+// WASM module
+//
+// Equivalent of ARM64:  ADD X0, X1, X2   (X0 = X1 + X2, low 32 bits)
+//
+// Exported as fn(a: i32, b: i32) -> i32 so the host can call it directly.
+// In the real Ballistic WASM backend this same byte stream is what gets
+// emitted per translated ARM block; the Compiler Shared Worker hands it
+// to WebAssembly.compile() exactly as we do here.
+//
+// Layout (binary spec v1):
+//   magic          00 61 73 6D
+//   version        01 00 00 00
+//   type sec  (1)  one type:  (i32, i32) -> i32
+//   func sec  (3)  one func of type 0
+//   export sec(7)  export "add" as func 0
+//   code sec (10)  body: local.get 0, local.get 1, i32.add, end
+//
+// Each section is [section_id, payload_size, ...payload].
+const wasmBytes = new Uint8Array([
+  0x00, 0x61, 0x73, 0x6D,  0x01, 0x00, 0x00, 0x00,
+
+  // type section
+  0x01, 0x07,
+    0x01,                          // 1 type
+    0x60,                          // func
+    0x02, 0x7F, 0x7F,              // 2 params: i32, i32
+    0x01, 0x7F,                    // 1 result: i32
+
+  // function section
+  0x03, 0x02,
+    0x01,                          // 1 func
+    0x00,                          // type index 0
+
+  // export section
+  0x07, 0x07,
+    0x01,                          // 1 export
+    0x03, 0x61, 0x64, 0x64,        // name "add"
+    0x00, 0x00,                    // kind=func, index=0
+
+  // code section
+  0x0A, 0x09,
+    0x01,                          // 1 function body
+    0x07,                          // body size
+    0x00,                          // 0 local decls
+    0x20, 0x00,                    // local.get 0
+    0x20, 0x01,                    // local.get 1
+    0x6A,                          // i32.add
+    0x0B,                          // end
+]);
+
+(async () => {
+  const status = document.getElementById("status");
+  try {
+    log("WASM bytes (" + wasmBytes.length + " B): " +
+        Array.from(wasmBytes, b => b.toString(16).padStart(2, "0")).join(" "));
+
+    const t0 = performance.now();
+    const mod = await WebAssembly.compile(wasmBytes);
+    const t1 = performance.now();
+    log("WebAssembly.compile() ok in " + (t1 - t0).toFixed(2) + " ms");
+
+    const inst = await WebAssembly.instantiate(mod, {});
+    const add  = inst.exports.add;
+    log("instantiated; exports.add = " + add);
+
+    // Execute with concrete inputs and verify.
+    const cases = [[1, 2], [40, 2], [0xFFFF, 1], [-7, 10]];
+    let allOk = true;
+    for (const [a, b] of cases) {
+      const got = add(a, b);
+      const want = (a + b) | 0;
+      const ok = got === want;
+      allOk = allOk && ok;
+      log("  add(" + a + ", " + b + ") = " + got +
+          (ok ? "  ok" : "  WRONG, expected " + want));
+    }
+
+    if (allOk) {
+      status.textContent = "ok — JIT pipeline functional";
+      status.className   = "ok";
+      log("PIPELINE OK", "ok");
+    } else {
+      status.textContent = "FAIL — execution mismatch";
+      status.className   = "bad";
+      log("PIPELINE FAILED", "bad");
+    }
+  } catch (e) {
+    status.textContent = "FAIL — " + e.message;
+    status.className   = "bad";
+    log("error: " + e.message, "bad");
+    log(e.stack || "");
+  }
+})();
+</script>
+</body>
+</html>
