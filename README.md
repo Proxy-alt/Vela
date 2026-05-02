@@ -1,4 +1,4 @@
-# Vela
+# Voland
 
 A Nintendo Switch emulator targeting the web as a primary platform, with native apps on iOS, Android, macOS, tvOS, Windows, Linux, and Xbox.
 
@@ -10,7 +10,7 @@ Play Switch games in your browser. No installation. No setup beyond providing yo
 
 ## Why web-first
 
-Every existing Switch emulator requires installation, driver configuration, and technical setup that eliminates most potential users before they ever reach a game. Vela's primary target is a browser tab - click a link, provide your keys and game files, play.
+Every existing Switch emulator requires installation, driver configuration, and technical setup that eliminates most potential users before they ever reach a game. Voland's primary target is a browser tab - click a link, provide your keys and game files, play.
 
 The web version is not a port of a native emulator. It is designed from the ground up for the browser, using a WASM-compiled C core, WebGPU rendering, SharedArrayBuffer for guest RAM, and a dedicated Worker per emulator subsystem.
 
@@ -25,7 +25,7 @@ To play games you must provide:
 - **prod.keys** - cryptographic keys dumped from your own Nintendo Switch using [Lockpick_RCM](https://github.com/s1204IT/Lockpick_RCM)
 - **Game files** - NSP or XCI files dumped from cartridges or digital purchases you own
 
-Vela does not and will never distribute keys, firmware, or game files. These must come from hardware you own. See the [dumping guide](docs/DUMPING.md) for instructions.
+Voland does not and will never distribute keys, firmware, or game files. These must come from hardware you own. See the [dumping guide](docs/DUMPING.md) for instructions.
 
 ---
 
@@ -62,7 +62,7 @@ Full architecture documentation: [DESIGN.md](docs/DESIGN.md)
 
 The primary recompiler target is [Ballistic](https://github.com/pound-emu/ballistic), a C rewrite of dynarmic currently in early development. Ballistic targets the specific performance bottlenecks in dynarmic - JIT state cache line overflow, block eviction pathology, heavy IR memory footprint, and missing peephole optimisation.
 
-The CPU backend vtable means Vela is not blocked on Ballistic. Current backend status:
+The CPU backend vtable means Voland is not blocked on Ballistic. Current backend status:
 
 | Backend | Status | Notes |
 |---|---|---|
@@ -71,7 +71,7 @@ The CPU backend vtable means Vela is not blocked on Ballistic. Current backend s
 | dynarmic | Planned | Interim desktop backend - archived upstream, requires patching for GCC 14 |
 | ballistic | Planned | Primary target, wired in when instruction coverage is sufficient |
 
-The WASM JIT pipeline - ARM bytecode → WASM bytecode → `WebAssembly.compile()` → cached module - is architecturally proven. Ballistic providing a WASM bytecode emission backend makes Vela the only Switch emulator that runs natively in a browser, on iOS without App Store restrictions, and on Xbox UWP. No other ARM recompiler targets this deployment surface.
+The WASM JIT pipeline - ARM bytecode → WASM bytecode → `WebAssembly.compile()` → cached module - is architecturally proven. Ballistic providing a WASM bytecode emission backend makes Voland the only Switch emulator that runs natively in a browser, on iOS without App Store restrictions, and on Xbox UWP. No other ARM recompiler targets this deployment surface.
 
 ---
 
@@ -105,8 +105,8 @@ The WASM JIT pipeline - ARM bytecode → WASM bytecode → `WebAssembly.compile(
 ### Web (requires Emscripten)
 
 ```bash
-git clone https://github.com/vela-emu/vela
-cd vela
+git clone https://github.com/Voland-emu/Voland
+cd Voland
 git submodule update --init --recursive
 
 emcmake cmake -B build/web \
@@ -194,13 +194,19 @@ Note: dynarmic is archived and no longer builds cleanly on GCC 14 without patchi
 
 ## Legal
 
-Vela is open source software released under the [GPL-2.0 license](LICENSE).
+Voland is open source software released under the [GPL-2.0 license](LICENSE).
 
-Vela does not include, distribute, or facilitate obtaining Nintendo's copyrighted material. prod.keys, firmware, and game files must be provided by the user from hardware they own. Forks or distributions that bundle Nintendo's IP are not affiliated with this project and are solely responsible for their own legal compliance.
+Voland does not include, distribute, or facilitate obtaining Nintendo's copyrighted material. prod.keys, firmware, and game files must be provided by the user from hardware they own. Forks or distributions that bundle Nintendo's IP are not affiliated with this project and are solely responsible for their own legal compliance.
 
-Vela is not affiliated with Nintendo Co., Ltd.
+Voland is not affiliated with Nintendo Co., Ltd.
 
 ---
+
+## About the name
+
+Voland is named for Völundr (Old Norse, also Wayland the Smith in Anglo-Saxon tradition) — the legendary craftsman of Germanic and Norse mythology, master of the forge.
+
+The name has a second well-known association: Voland is also Mikhail Bulgakov's name for the devil in *The Master and Margarita*, drawn from Goethe's *Faust*. The Norse origin is the substantive reason for the name; the literary echo is welcome.
 
 ## Acknowledgements
 
