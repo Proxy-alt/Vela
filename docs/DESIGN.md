@@ -1,16 +1,21 @@
-# Design Doc for a switch emulator
+# Voland — Design Document
+
+A Nintendo Switch emulator targeting the web as a primary platform, with native apps on iOS, Android, macOS, tvOS, visionOS, Windows, Linux, and Xbox.
 
 ---
 
 ## Table of Contents
 
 1. [Project Overview](#1-project-overview)
+   - 1.5 [Non-Goals](#15-non-goals)
+   - 1.6 [Legal Scope Boundaries](#16-legal-scope-boundaries)
 2. [Repository Structure](#2-repository-structure)
 3. [Core Principles](#3-core-principles)
 4. [Threading Model](#4-threading-model)
 5. [CPU Backend Interface](#5-cpu-backend-interface)
 6. [No-Op Backend](#6-no-op-backend)
 7. [Ballistic Integration Plan](#7-ballistic-integration-plan)
+   - 7b. [Ballistic WASM Backend Architecture](#7b-ballistic-wasm-backend-architecture)
 8. [HLE Service Layer](#8-hle-service-layer)
 9. [GPU Architecture](#9-gpu-architecture)
 10. [Audio Pipeline](#10-audio-pipeline)
@@ -27,6 +32,7 @@
 21. [Development Phases](#21-development-phases)
 22. [Contributing](#22-contributing)
 23. [Reference Implementations](#23-reference-implementations)
+24. [Risk Register](#24-risk-register)
 
 ---
 
@@ -63,167 +69,257 @@ The primary recompiler target is **Ballistic** (github.com/pound-emu/ballistic),
 
 ---
 
+## 1.5 Non-Goals
+
+To keep the project focused, several things are explicitly NOT goals. Contributors proposing features that fall under these will be redirected here.
+
+- **Faster than Ryujinx on desktop.** Mature native emulators (Ryujinx, Suyu, Citron) are ahead on raw performance and compatibility on desktop and will stay ahead. Voland's contribution is *deployment surface* (browser + every native platform), not speed. The desktop builds exist to support development and reach users on platforms where browser deployment isn't appropriate, not to compete on benchmark numbers.
+
+- **Day-one Switch 2 support.** Switch 2 is a future target, not a current one. The console is closed; meaningful Switch 2 work waits on the broader scene. Voland's architecture extends to Switch 2 (memory64, sparse VMM), but the project is not racing to be first.
+
+- **Hosting games or distributing Nintendo IP.** Voland never includes, distributes, or operates infrastructure that touches Nintendo's copyrighted material. Users provide their own keys, their own decrypted game files, from hardware they own. See §1.6 for the legal scope this implies.
+
+- **Wii U, GameCube, or other console emulation.** The architecture is Switch-specific. The CPU backend abstraction would technically allow other ARM-based or even non-ARM targets, but doing so dilutes the project's focus and inflates its scope beyond what a small team can sustain.
+
+- **Server-side emulation or cloud streaming.** Everything runs client-side in the browser or natively on the user's device. Voland operates no game-execution servers.
+
+- **Replacing reference implementations.** Ryubing, dynarmic, yuzu (archived), Emscripten Relooper are studied as references and reimplemented under Voland's architecture. We do not fork them, do not maintain compatibility with them, and do not aim to be a drop-in replacement for any of them.
+
+- **Aggregated cache or community-shared compiled artifacts.** Per the Yuzu shader cache shutdown precedent (March 2024 settlement), Voland does not operate any server that distributes cache derived from Nintendo binaries. Per-user caches stay local; manual export is supported for friend-to-friend sharing.
+
+---
+
+## 1.6 Legal Scope Boundaries
+
+Voland's design avoids functionality that has been the subject of recent emulator-targeted legal action. These boundaries are non-negotiable scope decisions, not optimizations to revisit later.
+
+### No decryption of Nintendo-encrypted content
+
+Voland accepts only **pre-decrypted** game files. Users decrypt NSP/XCI files using separate tools (hactool, nxdumptool, or equivalent) before providing files to Voland. The Voland codebase does not contain NCA decryption logic, does not consume Nintendo's prod.keys for decryption, and does not implement Nintendo's key-derivation scheme.
+
+**Why:** Section 1201 of the DMCA prohibits software that circumvents technological measures controlling access to copyrighted works, regardless of whether the user provides their own keys, regardless of the project being non-commercial, regardless of the user owning the games. This is the legal theory that:
+
+- Killed Yuzu (March 2024 settlement)
+- Killed Citra (same case, both Tropic Haze projects)
+- Triggered Suyu's DMCA pause and pre-decrypted-ROM transition (April 2026)
+
+Voland adopts the pre-decrypted-input posture from the start to avoid the same fate. The user-experience cost is real (users must learn a separate decryption tool); the alternative is being shut down.
+
+### No distribution of derived caches
+
+Per the Yuzu settlement's shutdown of shader cache distribution, Voland does not operate any server that aggregates compiled or transformed game-derived data. The "Increase performance for others" toggle (described later in this document) operates locally with manual export only — Voland infrastructure never holds user cache data.
+
+### No distribution of Nintendo IP in any form
+
+No keys, no firmware, no game files, no derivatives in the Voland repository or any Voland-operated infrastructure. The emulator is generic ARM64 runtime infrastructure; the user supplies the data. This is the same legal posture as Wine (doesn't decrypt Windows binaries) and QEMU (doesn't decrypt ARM firmware).
+
+### What this looks like to users
+
+```mermaid
+flowchart LR
+    HW["User's own<br/>Switch hardware"]
+    LP["Lockpick_RCM<br/>(separate tool)"]
+    KEYS["prod.keys<br/>(user holds)"]
+
+    DUMP["nxdumptool /<br/>hactool<br/>(separate tools)"]
+    NSP["NSP / XCI<br/>(encrypted)"]
+    NCA["Decrypted NCA<br/>(user holds)"]
+
+    VOLAND["Voland<br/>(consumes only<br/>pre-decrypted NCA)"]
+
+    HW --> LP
+    LP --> KEYS
+    KEYS -.->|"used by user<br/>with separate tools"| DUMP
+    HW --> NSP
+    NSP --> DUMP
+    DUMP --> NCA
+    NCA --> VOLAND
+
+    style VOLAND fill:#e8f4ff,stroke:#0066cc
+    style KEYS fill:#fff4e8,stroke:#cc6600
+    style NCA fill:#fff4e8,stroke:#cc6600
+```
+
+Voland's role is the rightmost box. Everything to the left is the user's responsibility, performed with tools that are not part of Voland.
+
+### What this means for code organization
+
+The loader subsystem (`core/hle/loader/`) accepts already-decrypted NCA files and parses their internal structure (RomFS, ExeFS, npdm). It does **not** contain encryption-handling code. There is no `nca_decrypt.c`, no key-derivation functions, no AES handling for game content, and no NSP/XCI extraction logic that operates on encrypted input.
+
+If a user attempts to load an encrypted NSP or XCI file, Voland reports an error directing them to decrypt using separate tools first.
+
+---
+
 ## 2. Repository Structure
 
+```mermaid
+flowchart TD
+    ROOT["voland/"]
+
+    subgraph TopLevel["Top-level"]
+        CM["CMakeLists.txt"]
+        GJ["global.json"]
+        GM[".gitmodules"]
+    end
+
+    subgraph Docs["docs/"]
+        D1["DESIGN.md (this file)"]
+        D2["DUMPING.md<br/>(separate-tools guide)"]
+        D3["SAVE_FORMAT.md"]
+        D4["TRACE_FORMAT.md"]
+    end
+
+    subgraph Core["core/ (C11, platform-agnostic)"]
+        CPU["cpu/<br/>backend abstraction +<br/>noop / interp / dynarmic / ballistic"]
+        HLE["hle/<br/>kernel, services, loader<br/>(decrypted NCA only)"]
+        GPU["gpu/<br/>Maxwell emulation +<br/>shader IR + WGSL/GLSL/MSL/HLSL"]
+        AUDIO["audio/<br/>DSP + WebAudio/WASAPI/<br/>CoreAudio/PipeWire"]
+        COMMON["common/<br/>arena, ring buffer,<br/>trace, log, vmm"]
+    end
+
+    subgraph Platform["platform/ (thin per-target layers)"]
+        WEB["web/<br/>Solid.js + WebGPU<br/>(primary target)"]
+        APPLE["ios / ipados /<br/>tvos / visionos / macos"]
+        ANDROID["android / android-tv"]
+        DESKTOP["windows / linux"]
+        XBOX["xbox<br/>(WinUI 2 + D3D12 UWP)"]
+    end
+
+    REC["recompiler/<br/>(Ballistic submodule)"]
+    TESTS["tests/<br/>cpu / hle / gpu / games"]
+
+    ROOT --> TopLevel
+    ROOT --> Docs
+    ROOT --> Core
+    ROOT --> Platform
+    ROOT --> REC
+    ROOT --> TESTS
 ```
-/
-├── CMakeLists.txt                     # root build file
-├── global.json                        # minimum tool versions
-├── .gitmodules                        # Ballistic as submodule
-├── docs/
-│   ├── DESIGN.md                      # this document
-│   ├── SAVE_FORMAT.md                 # save file binary format spec
-│   ├── TRACE_FORMAT.md                # trace buffer layout spec
-│   └── WASM_BACKEND.md                # Ballistic WASM backend design
-│
-├── core/                              # platform-agnostic C core (C11)
-│   ├── cpu/
-│   │   ├── cpu.h                      # abstract CPU backend interface
-│   │   ├── cpu.c                      # backend wiring and emulator loop
-│   │   └── backends/
-│   │       ├── noop/
-│   │       │   ├── noop.h
-│   │       │   └── noop.c             # no-op backend (default, always builds)
-│   │       ├── interpreter/
-│   │       │   ├── interpreter.h
-│   │       │   ├── interpreter.c      # pure ARM64 interpreter
-│   │       │   └── arm_decode.c       # ARM64 instruction decoder
-│   │       ├── dynarmic/
-│   │       │   ├── dynarmic.h
-│   │       │   └── dynarmic.cpp       # C++ wrapper around dynarmic
-│   │       └── ballistic/
-│   │           ├── ballistic.h
-│   │           └── ballistic.c        # Ballistic integration
-│   │
-│   ├── hle/                           # Switch OS high-level emulation
-│   │   ├── hle.h
-│   │   ├── hle.c                      # syscall dispatch table
-│   │   ├── kernel/
-│   │   │   ├── memory.h               # heap, virtual memory management
-│   │   │   ├── memory.c
-│   │   │   ├── thread.h               # thread creation and scheduling
-│   │   │   ├── thread.c
-│   │   │   └── ipc.h                  # inter-process communication
-│   │   │   └── ipc.c
-│   │   ├── services/
-│   │   │   ├── sm/                    # service manager (all services depend on this)
-│   │   │   ├── fsp/                   # filesystem (fsp-srv, fsp-ldr, fsp-pr)
-│   │   │   ├── audio/                 # IAudioDevice, IAudioRenderer, IAudioIn
-│   │   │   ├── hid/                   # IHidServer, controllers, gyro, NFC
-│   │   │   ├── nfc/                   # amiibo
-│   │   │   ├── network/               # LDN local play, BSD sockets
-│   │   │   ├── nvdrv/                 # NVIDIA driver, GPU command submission
-│   │   │   ├── time/                  # IStaticService, ITimeZoneService
-│   │   │   ├── applet/                # appletOE, appletAE, app lifecycle
-│   │   │   ├── account/               # user accounts
-│   │   │   ├── friends/               # friend list
-│   │   │   └── ssl/                   # TLS (stub)
-│   │   └── loader/
-│   │       ├── nca.h                  # Nintendo Content Archive parsing
-│   │       ├── nca.c
-│   │       ├── nsp.h                  # Nintendo Submission Package
-│   │       ├── nsp.c
-│   │       ├── xci.h                  # Game Card Image
-│   │       └── xci.c
-│   │
-│   ├── gpu/                           # Maxwell GPU emulation
-│   │   ├── gpu.h                      # abstract GPU backend interface
-│   │   ├── gpu.c
-│   │   ├── engines/
-│   │   │   ├── engine_2d.c            # 2D engine
-│   │   │   ├── engine_3d.c            # 3D engine (Kepler/Maxwell)
-│   │   │   └── engine_compute.c       # compute engine
-│   │   ├── memory/
-│   │   │   ├── gmmu.h                 # GPU memory management unit
-│   │   │   └── gmmu.c
-│   │   ├── shader/
-│   │   │   ├── decompiler.h           # Maxwell shader - IR
-│   │   │   ├── decompiler.c
-│   │   │   ├── uber_shader.h          # uber-shader fallback
-│   │   │   ├── uber_shader.c
-│   │   │   └── backends/
-│   │   │       ├── wgsl.c             # - WGSL (WebGPU)
-│   │   │       ├── glsl.c             # - GLSL (Vulkan)
-│   │   │       ├── msl.c              # - MSL (Metal)
-│   │   │       └── hlsl.c             # - HLSL (D3D12)
-│   │   └── texture/
-│   │       ├── decode.h               # texture format decoding
-│   │       ├── decode.c
-│   │       └── transcode.c            # ASTC - BC7/ETC2 via compute shader
-│   │
-│   ├── audio/
-│   │   ├── audio.h                    # abstract audio backend interface
-│   │   ├── audio.c
-│   │   ├── dsp/
-│   │   │   ├── dsp.h                  # DSP emulation
-│   │   │   └── dsp.c
-│   │   └── backends/
-│   │       ├── webaudio/              # Web Audio API
-│   │       ├── wasapi/                # Windows
-│   │       ├── coreaudio/             # Apple platforms
-│   │       └── pipewire/              # Linux
-│   │
-│   └── common/
-│       ├── arena.h                    # arena allocator, no malloc in hot paths
-│       ├── arena.c
-│       ├── ring_buffer.h              # lock-free ring buffer for audio
-│       ├── ring_buffer.c
-│       ├── log.h                      # structured logging to trace buffer
-│       ├── log.c
-│       ├── assert.h                   # debug assertions
-│       └── vmm.h                      # virtual memory manager (sparse, Switch 2)
-│       └── vmm.c
-│
-├── platform/
-│   ├── web/                           # WASM + TypeScript/Solid.js
-│   │   ├── vite.config.ts
-│   │   ├── tsconfig.json
-│   │   ├── index.html
-│   │   ├── manifest.json              # PWA manifest
-│   │   ├── bindings/                  # C - WASM - JS bridge
-│   │   │   ├── core.ts                # typed WASM exports
-│   │   │   └── protocol.ts            # worker message protocol types
-│   │   ├── workers/
-│   │   │   ├── cpu.worker.ts          # CPU emulation loop
-│   │   │   ├── gpu.worker.ts          # WebGPU rendering
-│   │   │   └── audio.worker.ts        # audio sample pipeline
-│   │   ├── shared-workers/
-│   │   │   ├── compiler.shared-worker.ts     # WebAssembly.compile() cache
-│   │   │   ├── save-sync.shared-worker.ts    # serialised OPFS save writes
-│   │   │   └── compatibility.shared-worker.ts # game compatibility DB
-│   │   ├── sw.ts                      # service worker
-│   │   └── src/
-│   │       ├── main.ts                # boot sequence
-│   │       ├── router.ts              # Navigation API routing
-│   │       ├── store/                 # Solid.js signals and stores
-│   │       ├── components/
-│   │       │   ├── GameLibrary/
-│   │       │   ├── GameCanvas/
-│   │       │   ├── Settings/
-│   │       │   ├── SaveManager/
-│   │       │   ├── ModManager/
-│   │       │   ├── CompatibilityList/
-│   │       │   └── Overlays/
-│   │       └── styles/
-│   │
-│   ├── ios/                           # SwiftUI + Metal
-│   ├── macos/                         # SwiftUI + Metal
-│   ├── tvos/                          # SwiftUI + Metal + focus engine
-│   ├── visionos/                      # SwiftUI + RealityKit + CompositorServices
-│   ├── android/                       # Jetpack Compose + Vulkan
-│   ├── android-tv/                    # Jetpack Compose + D-pad nav + Vulkan
-│   ├── windows/                       # Qt + Vulkan/D3D12
-│   ├── linux/                         # Qt + Vulkan
-│   └── xbox/                          # WinUI 2 + D3D12 (UWP, Developer Mode)
-│
-├── recompiler/                        # Ballistic git submodule
-│   └── (github.com/pound-emu/ballistic)
-│
-└── tests/
-    ├── cpu/                           # ARM instruction correctness tests
-    ├── hle/                           # HLE service implementation tests
-    ├── gpu/                           # GPU output correctness tests
-    └── games/                         # per-title compatibility regression tests
+
+Detailed layout for each subtree:
+
+```
+core/
+  cpu/
+    cpu.h                    # abstract CPU backend interface
+    cpu.c                    # backend wiring and emulator loop
+    backends/
+      noop/                  # default, always builds
+      interpreter/           # ARM64 interpreter
+      dynarmic/              # C++ wrapper around dynarmic
+      ballistic/             # Ballistic integration
+
+  hle/
+    hle.h
+    hle.c                    # syscall dispatch table
+    kernel/
+      memory.{h,c}           # heap, virtual memory management
+      thread.{h,c}           # thread creation and scheduling
+      ipc.{h,c}              # inter-process communication
+    services/
+      sm/                    # service manager
+      fsp/                   # filesystem (fsp-srv, fsp-ldr, fsp-pr)
+      audio/                 # IAudioDevice, IAudioRenderer, IAudioIn
+      hid/                   # IHidServer, controllers, gyro, NFC
+      nfc/                   # amiibo
+      network/               # LDN local play, BSD sockets
+      nvdrv/                 # NVIDIA driver, GPU command submission
+      time/                  # IStaticService, ITimeZoneService
+      applet/                # appletOE, appletAE, app lifecycle
+      account/               # user accounts
+      friends/               # friend list
+      ssl/                   # TLS (stub)
+    loader/
+      ## Voland's loader operates on PRE-DECRYPTED input only.
+      ## See §1.6. No NCA decryption code in this tree.
+      nca_parse.{h,c}        # parse decrypted NCA structure (RomFS, ExeFS, npdm)
+      romfs.{h,c}            # RomFS reader (decrypted input)
+      exefs.{h,c}            # ExeFS reader (decrypted input)
+      npdm.{h,c}             # process metadata reader (decrypted input)
+
+  gpu/
+    gpu.h                    # abstract GPU backend interface
+    gpu.c
+    engines/
+      engine_2d.c
+      engine_3d.c            # Kepler/Maxwell
+      engine_compute.c
+    memory/
+      gmmu.{h,c}             # GPU memory management unit
+    shader/
+      decompiler.{h,c}       # Maxwell shader → IR
+      uber_shader.{h,c}      # uber-shader fallback
+      backends/
+        wgsl.c               # WebGPU
+        glsl.c               # Vulkan
+        msl.c                # Metal
+        hlsl.c               # D3D12
+    texture/
+      decode.{h,c}           # texture format decoding
+      transcode.c            # ASTC → BC7/ETC2 via compute shader
+
+  audio/
+    audio.h                  # abstract audio backend interface
+    audio.c
+    dsp/
+      dsp.{h,c}              # DSP emulation
+    backends/
+      webaudio/              # Web Audio API
+      wasapi/                # Windows
+      coreaudio/             # Apple platforms
+      pipewire/              # Linux
+
+  common/
+    arena.{h,c}              # arena allocator, no malloc in hot paths
+    ring_buffer.{h,c}        # lock-free ring buffer for audio
+    log.{h,c}                # structured logging to trace buffer
+    assert.h                 # debug assertions
+    vmm.{h,c}                # virtual memory manager (sparse, Switch 2)
+
+platform/web/
+  vite.config.ts
+  tsconfig.json
+  index.html
+  manifest.json              # PWA manifest
+  bindings/                  # C ↔ WASM ↔ JS bridge
+    core.ts                  # typed WASM exports
+    protocol.ts              # worker message protocol types
+  workers/
+    cpu.worker.ts            # CPU emulation loop
+    gpu.worker.ts            # WebGPU rendering
+    audio.worker.ts          # audio sample pipeline
+  shared-workers/
+    compiler.shared-worker.ts          # WebAssembly.compile() cache
+    save-sync.shared-worker.ts         # serialised OPFS save writes
+    compatibility.shared-worker.ts     # game compatibility DB
+  sw.ts                      # service worker
+  src/
+    main.ts                  # boot sequence
+    router.ts                # Navigation API routing
+    store/                   # Solid.js signals and stores
+    components/
+      GameLibrary/
+      GameCanvas/
+      Settings/
+      SaveManager/
+      ModManager/
+      CompatibilityList/
+      Overlays/
+    styles/
+
+platform/{ios,macos,tvos,visionos}/   # SwiftUI + Metal
+platform/{android,android-tv}/        # Jetpack Compose + Vulkan
+platform/{windows,linux}/             # Qt + Vulkan/D3D12
+platform/xbox/                        # WinUI 2 + D3D12 (UWP, Developer Mode)
+
+recompiler/                           # Ballistic git submodule
+  (github.com/pound-emu/ballistic)
+
+tests/
+  cpu/                       # ARM instruction correctness tests
+  hle/                       # HLE service implementation tests
+  gpu/                       # GPU output correctness tests
+  games/                     # per-title compatibility regression tests
 ```
 
 ---
@@ -243,8 +339,8 @@ The primary recompiler target is **Ballistic** (github.com/pound-emu/ballistic),
 ```c
 // Good, intent is clear without comments
 void hle_dispatch_ipc_request(HLE_Context* context,
-                               uint64_t     target_session_handle,
-                               IPC_Message* message);
+                              uint64_t     target_session_handle,
+                              IPC_Message* message);
 
 // Bad, abbreviated to the point of obscurity
 void hle_dipc(HLE_Ctx* c, uint64_t h, IPC_Msg* m);
@@ -326,140 +422,186 @@ function err(error: string): Failure   { return { success: false, error }; }
 
 ### Thread layout
 
+```mermaid
+flowchart TB
+    subgraph Main["Main Thread"]
+        UI["Solid.js UI rendering"]
+        GP["Gamepad polling<br/>(navigator.getGamepads)"]
+        IN["Keyboard / pointer input"]
+        HID["WebHID / WebNFC /<br/>WebBluetooth (main only)"]
+        NAV["Navigation API routing"]
+        ORCH["Worker orchestration"]
+    end
+
+    subgraph CPU["CPU Worker (Dedicated)"]
+        EMUL["Emulation loop"]
+        BACK["Active CPU backend<br/>(noop/interp/dynarmic/ballistic)"]
+        HLED["HLE syscall dispatch"]
+    end
+
+    subgraph GPU["GPU Worker (Dedicated)"]
+        OFF["OffscreenCanvas (transferred)"]
+        WGPU["WebGPU command encoding"]
+        SHC["Shader compilation"]
+    end
+
+    subgraph AUDIO["Audio Worker (Dedicated)"]
+        RB["Read audio ring buffer"]
+        AWP["AudioWorkletProcessor feed"]
+    end
+
+    subgraph SHARED["Shared Workers (one per origin, all tabs)"]
+        COMP["Compiler<br/>(WebAssembly.compile cache)"]
+        SAVE["Save Sync<br/>(serialise OPFS writes)"]
+        DB["Compatibility DB"]
+    end
+
+    SW["Service Worker<br/>(navigation, app shell, WASM cache,<br/>COOP/COEP injection)"]
+
+    Main -->|postMessage| CPU
+    Main -->|postMessage| GPU
+    Main -->|postMessage| AUDIO
+    Main <-->|MessagePort| SHARED
+    CPU <-->|MessagePort| SHARED
+    GPU <-->|MessagePort| SHARED
+
+    CPU <-.->|Atomics.wait/notify| GPU
+    CPU -.->|SharedArrayBuffer| AUDIO
+
+    SW -.->|intercepts navigation| Main
 ```
-Main Thread
-  ├── Solid.js UI rendering
-  ├── Gamepad polling (navigator.getGamepads, main thread only)
-  ├── Keyboard / pointer input events
-  ├── WebHID / WebNFC / WebBluetooth (main thread only APIs)
-  ├── Navigation API routing
-  └── Worker orchestration
 
-CPU Worker (Dedicated, one per tab)
-  ├── Emulation loop
-  ├── WASM Ballistic core (or interpreter/dynarmic)
-  ├── HLE syscall dispatch
-  └── Calls Atomics.wait to sync with GPU Worker
-
-GPU Worker (Dedicated, one per tab)
-  ├── Owns OffscreenCanvas (transferred, main thread cannot touch after transfer)
-  ├── WebGPU command encoding and submission
-  ├── Shader compilation pipeline
-  └── Calls Atomics.wait to sync with CPU Worker
-
-Audio Worker (Dedicated, one per tab)
-  ├── Reads from audio ring buffer (SharedArrayBuffer)
-  ├── Feeds AudioWorkletProcessor
-  └── Runs at audio thread priority
-
-Compiler Shared Worker (Shared, one instance across all tabs)
-  ├── Receives ARM bytecode blocks via MessagePort
-  ├── Calls WebAssembly.compile(), async, off CPU worker thread
-  ├── Caches compiled WebAssembly.Module in memory and OPFS
-  └── Returns WebAssembly.Module to requesting CPU Worker
-
-Save Sync Shared Worker (Shared, one instance across all tabs)
-  ├── Serialises all OPFS save file writes
-  └── Prevents corruption when multiple tabs touch the same title ID
-
-Compatibility DB Shared Worker (Shared, one instance across all tabs)
-  ├── Fetches and caches the game compatibility database
-  └── All tabs query through here, single fetch, shared result
-
-Service Worker (Per origin, one instance)
-  ├── Serves index.html for ALL navigation requests (enables /game/:titleId on hard refresh)
-  ├── Caches app shell: index.html, app.js, ballistic.wasm, styles.css
-  ├── Injects COEP/COOP headers on cached responses
-  └── Caches WASM binary aggressively (large, never changes between versions)
-```
+The dashed lines indicate shared-memory synchronization (Atomics + SharedArrayBuffer); solid lines are message-passing (postMessage / MessagePort).
 
 ### Shared memory layout
 
+| Buffer | Size | Producers | Consumers | Sync |
+|---|---|---|---|---|
+| Guest RAM | 4GB (memory64) | CPU Worker | CPU Worker, GPU Worker (framebuffer read) | Frame Sync below |
+| Frame Sync | 4 bytes (Int32) | CPU Worker writes 1 on frame ready | GPU Worker waits on 0→1 | Atomics.store + Atomics.notify |
+| Audio Ring | configurable | CPU Worker writes samples | Audio Worker reads | Atomics.notify on write |
+| Trace Buffer | 64KB+ | All workers (atomic write index) | UI thread (timeline), Chrome extension (out-of-process) | Atomic write index |
+| Breakpoint Buffer | sparse, page-indexed | Chrome extension or in-page debugger | CPU Worker (checks on block entry) | Atomic flag bits |
+
+### Frame synchronization flow
+
+```mermaid
+sequenceDiagram
+    participant CPU as CPU Worker
+    participant FS as Frame Sync<br/>(SharedArrayBuffer)
+    participant GPU as GPU Worker
+
+    Note over CPU,GPU: Initial: frame ready flag = 0
+    CPU->>CPU: emulate frame
+    CPU->>CPU: write framebuffer<br/>to guest RAM
+    CPU->>FS: Atomics.store(0, 1)
+    CPU->>FS: Atomics.notify
+    FS-->>GPU: wakes
+    GPU->>GPU: read framebuffer<br/>from guest RAM
+    GPU->>GPU: upload to GPUTexture
+    GPU->>GPU: present frame
+    GPU->>FS: Atomics.store(0, 0)
+    GPU->>FS: Atomics.notify
+    FS-->>CPU: wakes for next frame
 ```
-SharedArrayBuffer, Guest RAM (4GB, memory64)
-  Used by: CPU Worker (read/write), GPU Worker (read framebuffer)
-  Atomics used for: none, GPU reads after CPU signals frame ready
 
-SharedArrayBuffer, Frame Sync (4 bytes, Int32Array)
-  [0]: frame ready flag (0 = CPU running, 1 = frame ready for GPU)
-  CPU Worker: Atomics.store(1) + Atomics.notify after each frame
-  GPU Worker: Atomics.wait(0) blocking until frame ready
+### Data flow through workers
 
-SharedArrayBuffer, Audio Ring Buffer (configurable size)
-  [0..3]:   write index (Int32, CPU Worker writes)
-  [4..7]:   read index  (Int32, Audio Worker reads)
-  [8..N]:   Float32 sample data
-  CPU Worker: Atomics.store + Atomics.notify on write
-  Audio Worker: Atomics.wait when buffer empty
+```mermaid
+flowchart LR
+    CTRL["Controller input<br/>(main thread polls<br/>each rAF)"]
+    CPU["CPU Worker"]
+    GR["Guest RAM<br/>(SharedArrayBuffer)"]
+    AR["Audio Ring<br/>(SharedArrayBuffer)"]
+    GPU["GPU Worker"]
+    AUD["Audio Worker"]
+    AWP["AudioWorkletProcessor"]
+    OFF["OffscreenCanvas"]
 
-SharedArrayBuffer, Trace Buffer (developer tooling)
-  [0..3]:   write index (Int32, atomic)
-  [8..N]:   Trace_Event structs (24 bytes each)
-  Written by: CPU Worker, GPU Worker, Audio Worker
-  Read by: UI thread (timeline display), Chrome extension (out-of-process)
-
-SharedArrayBuffer, Breakpoint Buffer (developer tooling)
-  Sparse flags indexed by guest page address >> 12
-  Written by: Chrome extension or in-page debugger UI
-  Read by: CPU Worker on each block entry (hot path, keep check cheap)
+    CTRL -->|postMessage<br/>gamepad state| CPU
+    CPU -->|emulate, write framebuffer| GR
+    CPU -->|samples| AR
+    GR -->|read framebuffer| GPU
+    GPU -->|present| OFF
+    AR -->|read samples| AUD
+    AUD --> AWP
+    AWP -->|system audio| Speakers["System audio output"]
 ```
 
-### Data flow
+### JIT compilation pipeline
 
+```mermaid
+flowchart TD
+    IB["CPU Worker:<br/>encounters untranslated<br/>ARM block at GVA X"]
+    INTERP["Run via interpreter<br/>(slow path, immediate)"]
+    DEC["ARM decoder →<br/>Ballistic IR<br/>(SSA, scope-based CF)"]
+    EMIT["WASM backend walks IR<br/>via cursor (Rule 2)<br/>static inline emit"]
+    BYTES["WASM module bytes<br/>in output buffer"]
+
+    POST["Post bytes to<br/>Compiler Shared Worker"]
+    CACHE_M["Memory module cache<br/>(keyed by guest address +<br/>ir_build_id)"]
+    CACHE_O["OPFS module cache"]
+    COMP["WebAssembly.compile()"]
+    MOD["WebAssembly.Module"]
+
+    POST_BACK["Post module back<br/>to CPU Worker"]
+    INST["WebAssembly.instantiate(<br/>module, { env: { memory,<br/>read_reg, write_reg, call_hle }})"]
+    BC["instance.exports.entry<br/>cached in block cache<br/>at guest address X"]
+    FAST["Subsequent executions:<br/>call entry directly<br/>(fast path)"]
+
+    IB --> INTERP
+    INTERP --> DEC
+    DEC --> EMIT
+    EMIT --> BYTES
+    BYTES --> POST
+    POST --> CACHE_M
+    CACHE_M -->|hit| POST_BACK
+    CACHE_M -->|miss| CACHE_O
+    CACHE_O -->|hit| POST_BACK
+    CACHE_O -->|miss| COMP
+    COMP --> MOD
+    MOD --> CACHE_M
+    MOD --> CACHE_O
+    MOD --> POST_BACK
+    POST_BACK --> INST
+    INST --> BC
+    BC --> FAST
 ```
-Controller input
-  main thread polls navigator.getGamepads() each requestAnimationFrame
-  - postMessage({ type: "gamepad", buttons: [...], axes: [...] }) to CPU Worker
 
-CPU Worker
-  - runs ARM blocks via active backend (noop/interpreter/dynarmic/ballistic)
-  - HLE syscalls dispatched to service implementations in C core
-  - writes framebuffer to SharedArrayBuffer at known offset
-  - writes audio samples to ring buffer
-  - Atomics.store(frameSync, 0, 1)
-  - Atomics.notify(frameSync, 0, 1)
-
-GPU Worker
-  - Atomics.wait(frameSync, 0, 0)   [blocks until frame ready]
-  - reads framebuffer from SharedArrayBuffer
-  - uploads to GPUTexture
-  - encodes render pass, submits to WebGPU device
-  - presents to OffscreenCanvas
-  - Atomics.store(frameSync, 0, 0)
-  - Atomics.notify(frameSync, 0, 1) [signal CPU to run next frame]
-
-Audio Worker
-  - reads Float32 samples from ring buffer
-  - feeds AudioWorkletProcessor
-  - AudioWorklet outputs to system audio
-
-### JIT compilation path (Ballistic WASM backend)
-
-CPU Worker encounters untranslated ARM block at guest address X
-  - runs block through interpreter (slow path, immediate)
-  - ARM decoder produces Ballistic IR (flat instruction array, strict SSA,
-    scope-based control flow)
-  - WASM backend walks IR instruction array via cursor (Rule 2, no index math)
-  - static inline emit functions fold into translation loop (no indirect dispatch)
-  - emit produces complete WASM module bytes in output buffer
-  - bytes posted to Compiler Shared Worker via platform callback
-
-Compiler Shared Worker
-  - WebAssembly.compile(bytes)
-  - caches WebAssembly.Module by guest address in memory and OPFS
-  - posts module back to CPU Worker
-
-CPU Worker
-  - WebAssembly.instantiate(module, { env: { memory, read_reg, write_reg, call_hle } })
-  - caches instance.exports.entry by guest address
-  - subsequent executions call entry directly (fast path)
-```
+The cache key includes `ir_build_id` so that IR-layer compaction passes (which can change SSA index assignments) correctly invalidate previously-compiled modules. See §11 (Storage Architecture).
 
 ---
 
 ## 5. CPU Backend Interface
 
 This interface is the most important abstraction in the project. Every backend implements it exactly. Nothing outside the backend code knows or cares which backend is active.
+
+### Interface relationships
+
+```mermaid
+flowchart TB
+    EM["Emulator core"]
+
+    subgraph BACKENDS["CPU_Backend (vtable)"]
+        NOOP["CPU_BACKEND_NOOP<br/>(default, always builds)"]
+        INT["CPU_BACKEND_INTERPRETER<br/>(slow but correct)"]
+        DYN["CPU_BACKEND_DYNARMIC<br/>(interim desktop)"]
+        BAL["CPU_BACKEND_BALLISTIC<br/>(primary target)"]
+    end
+
+    subgraph CB["Callbacks (set by emulator)"]
+        SVC["CPU_SVC_Handler<br/>→ HLE syscall dispatch"]
+        UND["CPU_Undefined_Handler"]
+        BP["CPU_Breakpoint_Handler"]
+    end
+
+    EM -->|"cpu_get_active_backend()"| BACKENDS
+    BACKENDS -->|on SVC| SVC
+    BACKENDS -->|on undef| UND
+    BACKENDS -->|on bp hit| BP
+```
+
+### Header
 
 ```c
 // core/cpu/cpu.h
@@ -496,13 +638,8 @@ typedef struct CPU_Backend {
   void (*destroy)(CPU_State* state);
 
   // Execution
-  // Run continuously from entry_point until halted
   void (*run)(CPU_State* state, uint64_t entry_point);
-
-  // Execute exactly one instruction at current PC
   void (*step)(CPU_State* state);
-
-  // Run until PC == address or halted
   void (*run_until)(CPU_State* state, uint64_t address);
 
   // General purpose registers X0-X30 (index 0-30)
@@ -525,10 +662,9 @@ typedef struct CPU_Backend {
   void (*halt)(CPU_State* state);
   bool (*is_halted)(CPU_State* state);
 
-  // Code cache management
-  // Call after writing to guest RAM (self-modifying code, JIT patching)
+  // Code cache management (call after writing to guest RAM, e.g. self-modifying code)
   void (*invalidate_cache)(CPU_State* state, uint64_t guest_address, uint64_t size_bytes);
-  void (*clear_cache)(CPU_State* state); // invalidate entire cache
+  void (*clear_cache)(CPU_State* state);
 
   // Callback registration
   void (*set_svc_handler)(CPU_State* state, CPU_SVC_Handler handler);
@@ -551,7 +687,6 @@ extern const CPU_Backend CPU_BACKEND_BALLISTIC;  // only if built with -DCPU_BAC
 
 //  Backend selection
 
-// Returns the active backend based on build configuration
 const CPU_Backend* cpu_get_active_backend(void);
 ```
 
@@ -584,6 +719,38 @@ The no-op backend is the default. It builds on all platforms with zero dependenc
 
 **Every subsystem except actual game execution can be built and tested with the no-op backend.**
 
+### Why this matters
+
+```mermaid
+flowchart LR
+    subgraph Phase01["Phase 0/1 Development"]
+        WEB["Web platform layer"]
+        STO["Storage layer"]
+        UI["UI components"]
+        WORK["Worker architecture"]
+        SW["Service Worker"]
+        HLES["HLE service stubs"]
+    end
+
+    NOOP["No-op CPU backend<br/>(register state +<br/>SVC dispatch only)"]
+
+    Phase01 -->|all developable<br/>against| NOOP
+
+    BAL["Ballistic JIT<br/>(any state of completion)"]
+    DYN["Dynarmic"]
+    INT["Interpreter"]
+
+    NOOP -.->|swap to| BAL
+    NOOP -.->|swap to| DYN
+    NOOP -.->|swap to| INT
+
+    style NOOP fill:#e8f4ff,stroke:#0066cc
+```
+
+The entire frontend, storage layer, worker architecture, Service Worker, and HLE scaffolding can be built, tested, and reviewed without any working CPU emulation. This decouples Voland's development from Ballistic's development entirely.
+
+### Implementation
+
 ```c
 // core/cpu/backends/noop/noop.c
 
@@ -601,8 +768,8 @@ typedef struct {
   void*            guest_ram;
   uint64_t         ram_size;
   void*            userdata;
-  CPU_SVC_Handler       svc_handler;
-  CPU_Undefined_Handler undefined_handler;
+  CPU_SVC_Handler        svc_handler;
+  CPU_Undefined_Handler  undefined_handler;
   CPU_Breakpoint_Handler breakpoint_handler;
 } NoopState;
 
@@ -628,13 +795,8 @@ static void noop_run(CPU_State* state, uint64_t entry_point) {
   // directly through the SVC handler, not through instruction execution
 }
 
-static void noop_step(CPU_State* state) {
-  // No-op
-}
-
-static void noop_run_until(CPU_State* state, uint64_t address) {
-  // No-op
-}
+static void noop_step(CPU_State* state)                          { /* no-op */ }
+static void noop_run_until(CPU_State* state, uint64_t address)   { /* no-op */ }
 
 static uint64_t noop_get_reg(CPU_State* state, uint8_t index) {
   if (index >= 31) return 0; // XZR
@@ -646,12 +808,12 @@ static void noop_set_reg(CPU_State* state, uint8_t index, uint64_t value) {
   ((NoopState*)state)->general_regs[index] = value;
 }
 
-static uint64_t noop_get_pc(CPU_State* state)            { return ((NoopState*)state)->pc; }
-static void     noop_set_pc(CPU_State* state, uint64_t v){ ((NoopState*)state)->pc = v; }
-static uint64_t noop_get_sp(CPU_State* state)            { return ((NoopState*)state)->sp; }
-static void     noop_set_sp(CPU_State* state, uint64_t v){ ((NoopState*)state)->sp = v; }
-static uint32_t noop_get_pstate(CPU_State* state)            { return ((NoopState*)state)->pstate; }
-static void     noop_set_pstate(CPU_State* state, uint32_t v){ ((NoopState*)state)->pstate = v; }
+static uint64_t noop_get_pc(CPU_State* state)                    { return ((NoopState*)state)->pc; }
+static void     noop_set_pc(CPU_State* state, uint64_t v)        { ((NoopState*)state)->pc = v; }
+static uint64_t noop_get_sp(CPU_State* state)                    { return ((NoopState*)state)->sp; }
+static void     noop_set_sp(CPU_State* state, uint64_t v)        { ((NoopState*)state)->sp = v; }
+static uint32_t noop_get_pstate(CPU_State* state)                { return ((NoopState*)state)->pstate; }
+static void     noop_set_pstate(CPU_State* state, uint32_t v)    { ((NoopState*)state)->pstate = v; }
 
 static uint64_t noop_get_sys_reg(CPU_State* state, uint32_t reg) { return 0; }
 static void     noop_set_sys_reg(CPU_State* state, uint32_t reg, uint64_t value) { }
@@ -673,32 +835,32 @@ static void noop_set_breakpoint_handler(CPU_State* state, CPU_Breakpoint_Handler
 }
 
 const CPU_Backend CPU_BACKEND_NOOP = {
-  .create                = noop_create,
-  .destroy               = noop_destroy,
-  .run                   = noop_run,
-  .step                  = noop_step,
-  .run_until             = noop_run_until,
-  .get_reg               = noop_get_reg,
-  .set_reg               = noop_set_reg,
-  .get_pc                = noop_get_pc,
-  .set_pc                = noop_set_pc,
-  .get_sp                = noop_get_sp,
-  .set_sp                = noop_set_sp,
-  .get_pstate            = noop_get_pstate,
-  .set_pstate            = noop_set_pstate,
-  .get_sys_reg           = noop_get_sys_reg,
-  .set_sys_reg           = noop_set_sys_reg,
-  .halt                  = noop_halt,
-  .is_halted             = noop_is_halted,
-  .invalidate_cache      = noop_invalidate_cache,
-  .clear_cache           = noop_clear_cache,
-  .set_svc_handler       = noop_set_svc_handler,
-  .set_undefined_handler = noop_set_undefined_handler,
-  .set_breakpoint_handler= noop_set_breakpoint_handler,
-  .name                  = "noop",
-  .version               = "1.0.0",
-  .supports_jit          = false,
-  .supports_wasm         = false,
+  .create                 = noop_create,
+  .destroy                = noop_destroy,
+  .run                    = noop_run,
+  .step                   = noop_step,
+  .run_until              = noop_run_until,
+  .get_reg                = noop_get_reg,
+  .set_reg                = noop_set_reg,
+  .get_pc                 = noop_get_pc,
+  .set_pc                 = noop_set_pc,
+  .get_sp                 = noop_get_sp,
+  .set_sp                 = noop_set_sp,
+  .get_pstate             = noop_get_pstate,
+  .set_pstate             = noop_set_pstate,
+  .get_sys_reg            = noop_get_sys_reg,
+  .set_sys_reg            = noop_set_sys_reg,
+  .halt                   = noop_halt,
+  .is_halted              = noop_is_halted,
+  .invalidate_cache       = noop_invalidate_cache,
+  .clear_cache            = noop_clear_cache,
+  .set_svc_handler        = noop_set_svc_handler,
+  .set_undefined_handler  = noop_set_undefined_handler,
+  .set_breakpoint_handler = noop_set_breakpoint_handler,
+  .name                   = "noop",
+  .version                = "1.0.0",
+  .supports_jit           = false,
+  .supports_wasm          = false,
 };
 ```
 
@@ -708,80 +870,75 @@ const CPU_Backend CPU_BACKEND_NOOP = {
 
 ### What Ballistic is
 
-Ballistic (github.com/pound-emu/ballistic) is a C rewrite of the dynarmic ARM recompiler targeting the following improvements over dynarmic:
+Ballistic ([github.com/pound-emu/ballistic](https://github.com/pound-emu/ballistic)) is a C rewrite of the dynarmic ARM recompiler targeting:
 
 - JIT state struct packed within a single CPU cache line (≤64 bytes)
 - Dense array + index linked lists replacing pointer-chasing intrusive lists
 - Lightweight IR with minimal per-instruction memory footprint
-- Peephole optimiser pass before code emission
+- Peephole optimizer pass before code emission
 - Correct XMM/SIMD register spilling
 - Base+index addressing throughout (avoids 8-byte pointer loads)
-- Devirtualization not needed, written in C, no virtual dispatch
+- No virtual dispatch (written in C, compile-time backend selection)
 
-**Current status (April 2026):** Implementing basic arithmetic instructions. IR layer in design phase.
+**Current status (April 2026):** Working barebones x86 backend exists in `src/backend/x86/` (assembler + sliding-window peephole + Tier 1 compiler with greedy register allocator). WASM backend in design.
 
-### IR requirements - status
+### IR requirements — status
 
 | Requirement | Status | Notes |
 |---|---|---|
 | CFG preserved to backend | ✓ Confirmed | Scope-based IR, no jumps |
 | SSA value numbering | ✓ Confirmed | Strict SSA, implicit indexing |
-| Backend vtable | Resolved differently | Compile-time via static inline headers |
+| Backend abstraction | Resolved differently | Compile-time via static inline headers + per-backend compiler structs |
 
-The backend interface question resolved differently than originally designed.
-GloriousTacoo's D-cache constraint makes function pointer dispatch in the
-translation loop unacceptable. The compile-time macro/inline approach satisfies
-both the performance constraint and the multi-backend requirement - each
-backend is a header of static inline functions selected at compile time.
+The backend interface question resolved differently than originally designed. GloriousTacoo's D-cache constraint (PROGRAMMING_RULES.md) makes function-pointer dispatch in the translation loop unacceptable. The compile-time approach satisfies both the performance constraint and the multi-backend requirement: each backend lives in its own subdirectory with its own compiler struct, selected at compile time via CMake option.
 
-**Requirement 1, CFG must be preserved to the backend**
+### Backend compilation flow
 
-WASM requires structured control flow. The Relooper algorithm recovers structured control flow from a Control Flow Graph. It cannot operate on a flattened jump-based representation. If the IR discards CFG edges before the backend sees them, a WASM backend cannot be written without restructuring the entire compilation pipeline.
+```mermaid
+flowchart TB
+    BUILD["CMake configures with<br/>-DBALLISTIC_BACKEND=wasm or =x86"]
 
-```
-Required IR shape:
-  IR_Block {
-    instructions[]
-    successors[2]      ← CFG edges must be explicit
-    branch_condition   ← condition for taken/not-taken
-  }
+    subgraph Sources["Ballistic source tree"]
+        IR["src/ir/<br/>(architecture-agnostic)"]
+        DEC["src/decoder/<br/>(architecture-agnostic)"]
 
-Unacceptable IR shape:
-  IR_Instr { op: JMP, target: 0x1000 }  ← discards CFG structure
-```
+        subgraph X86Tree["src/backend/x86/"]
+            X86A["bal_x86_assembler.{h,c}"]
+            X86W["bal_x86_sliding_window.{h,c}"]
+            X86C["bal_x86_tier1_compiler.{h,c}"]
+        end
 
-**Requirement 2, SSA value numbering, not fixed register file**
+        subgraph WASMTree["src/backend/wasm/"]
+            WASMA["bal_wasm_assembler.{h,c}"]
+            WASMM["bal_wasm_module.{h,c}"]
+            WASMC["bal_wasm_tier1_compiler.{h,c}"]
+        end
+    end
 
-WASM is a stack machine. SSA values map directly to WASM locals without a register allocator. A fixed register file IR requires an allocator in the WASM backend that adds complexity with no benefit.
-
-```c
-// Required: SSA values
-typedef struct IR_Value {
-  uint32_t id;     // unique per function, not tied to physical register
-  uint8_t  width;  // 8, 16, 32, 64
-} IR_Value;
-
-// Unacceptable: fixed register file
-typedef struct IR_Instr {
-  uint8_t dst_reg; // ties IR to physical ARM or x86 registers
-  uint8_t src_reg;
-} IR_Instr;
+    BUILD -->|wasm: include WASMTree| WASMTree
+    BUILD -->|x86: include X86Tree| X86Tree
+    IR --> X86Tree
+    IR --> WASMTree
+    DEC --> X86Tree
+    DEC --> WASMTree
 ```
 
-**Requirement 3, Backend vtable, not compiled-in**
+### Voland's CPU backend matrix
 
-WASM must be one target among equals. If the backend is compiled in rather than a function pointer table, adding WASM requires modifying the core IR code rather than adding a new file.
+The interim path Voland's DESIGN.md previously described (interpreter → dynarmic → ballistic) can now skip dynarmic entirely. Once Ballistic's x86 backend reaches sufficient instruction coverage, it replaces dynarmic as the desktop JIT path, removing Voland's dependency on dynarmic's archived codebase (which requires GCC 14 patches to build).
 
-```c
-// Required: vtable
-typedef struct Ballistic_Backend {
-  void* (*alloc_executable)(void* ctx, size_t size);
-  void  (*commit_executable)(void* ctx, void* mem, size_t size);
-  void  (*emit_instruction)(void* ctx, IR_Instr* instr);
-  void  (*emit_branch)(void* ctx, IR_Block* from, IR_Block* to, IR_BranchCond cond);
-  Ballistic_CompiledBlock (*finalise)(void* ctx);
-  const char* name;
-} Ballistic_Backend;
+```mermaid
+flowchart LR
+    NOOP["noop<br/>(default, always builds)"]
+    INT["interpreter<br/>(unblocks homebrew)"]
+    BX86["ballistic-x86<br/>(desktop JIT)"]
+    BWASM["ballistic-wasm<br/>(browser JIT,<br/>primary target)"]
+
+    NOOP -->|"Phase 2"| INT
+    INT -->|"Phase 5,<br/>desktop"| BX86
+    INT -->|"Phase 5,<br/>web"| BWASM
+
+    style BWASM fill:#e8f4ff,stroke:#0066cc
 ```
 
 ### Executable memory abstraction per platform
@@ -816,200 +973,144 @@ void wasm_commit_executable(void* ctx, void* mem, size_t size) {
 }
 ```
 
-### NEON - WASM SIMD mapping
+### NEON ↔ WASM SIMD mapping
 
-ARM NEON v8-v31 registers (128-bit) map directly to WASM v128 type. This must be documented explicitly in the Ballistic WASM backend and verified in the CMake build:
+ARM NEON v8-v31 registers (128-bit) map directly to WASM v128. This must be enabled in the CMake build:
 
 ```cmake
-# Required for WASM SIMD, without this performance drops ~4x for vertex processing
+# Required for WASM SIMD; without this performance drops ~4x for vertex processing
 if(EMSCRIPTEN)
   target_compile_options(switch_core PRIVATE -msimd128)
 endif()
 ```
 
-Key NEON - WASM SIMD mappings:
-```
-NEON vadd.i32  - i32x4.add
-NEON vmul.f32  - f32x4.mul
-NEON vld1.32   - v128.load
-NEON vst1.32   - v128.store
-NEON vceq.i32  - i32x4.eq
-NEON vshl.i32  - i32x4.shl
-```
-
-### WASM JIT compilation pipeline
+Key mappings:
 
 ```
-ARM block at guest address X
-  [CPU Worker, synchronous]
-  1. Decode ARM instructions - IR blocks (preserving CFG)
-  2. Run IR through interpreter for this frame (slow path, immediate)
-  3. Post { address: X, irBlocks: serialised IR } to Compiler Shared Worker
-
-  [Compiler Shared Worker, async]
-  4. Check memory module cache - return if hit
-  5. Check OPFS module cache - return if hit
-  6. Run Relooper on CFG - structured control flow tree
-  7. Emit WASM bytecode from structured CF tree
-  8. WebAssembly.compile(wasmBytes) - WebAssembly.Module
-  9. Cache module in memory and OPFS
-  10. Post { address: X, module } back to CPU Worker
-
-  [CPU Worker, on message receipt]
-  11. WebAssembly.instantiate(module, {
-        env: {
-          memory: guestRAM,          // imported SharedArrayBuffer memory
-          read_register: ...,
-          write_register: ...,
-          call_hle: ...
-        }
-      })
-  12. Store compiled entry point in block cache at address X
-  13. Next execution of X: call compiled entry point directly (fast path)
+NEON vadd.i32  →  i32x4.add
+NEON vmul.f32  →  f32x4.mul
+NEON vld1.32   →  v128.load
+NEON vst1.32   →  v128.store
+NEON vceq.i32  →  i32x4.eq
+NEON vshl.i32  →  i32x4.shl
 ```
-
-### Relooper algorithm for irregular control flow
-
-Most Switch game ARM code has reducible CFGs (single-entry loops). Irreducible CFGs (multiple loop entry points) require a dispatch variable:
-
-```wasm
-;; Irreducible CFG, two blocks that can enter each other
-(local $dispatch i32)
-(loop $top
-  (block $case_b
-    (block $case_a
-      (local.get $dispatch)
-      (br_table $case_a $case_b)
-    )
-    ;; Block A code
-    (i32.const 1)
-    (local.set $dispatch)
-    (br $top)
-  )
-  ;; Block B code
-  (i32.const 0)
-  (local.set $dispatch)
-  (br $top)
-)
-```
-
-Reference implementation: Emscripten Relooper (github.com/emscripten-core/emscripten/blob/main/tools/relooper)
 
 ---
 
 ## 7b. Ballistic WASM Backend Architecture
 
-### Compile-time backend selection
+The WASM backend mirrors the x86 backend's three-layer structure visible in `src/backend/x86/`. See the Ballistic repo's `docs/WASM_BACKEND_DESIGN_DOC.md` for the full design.
 
-The WASM backend follows Ballistic's D-cache performance philosophy exactly.
-No function pointers in the translation loop. Backend selection is a compile-time
-decision - the correct emit functions are included as static inline headers and
-folded into the translation loop by the compiler.
+### Three-layer architecture
 
-cmake -DCPU_BACKEND=ballistic-wasm ..   # web target
-cmake -DCPU_BACKEND=ballistic-x86  ..   # desktop target
+```mermaid
+flowchart TD
+    ARM["ARM64 instructions"]
+    DEC["bal_decode_arm64()"]
 
-### File structure
+    subgraph Compiler["bal_wasm_tier1_compiler_t<br/>(orchestration)"]
+        DISPATCH["IR opcode dispatch"]
+        STATE["JIT state:<br/>local_count,<br/>locals_patch_offset,<br/>guest_address, callback"]
+    end
 
-backend/
-  wasm/
-    emit.h      ← static inline emit functions, included at compile time
-    emit.c      ← LEB128 encoding, buffer growth (too branchy to inline)
-    module.h    ← WASM module builder interface
-    module.c    ← header, section, finalise (called once per block, not hot)
-  x86/
-    emit.h      ← same pattern, x86 opcodes
+    subgraph Assembler["bal_wasm_assembler_t<br/>(byte emission)"]
+        EMIT["bal_wasm_emit_*"]
+        BUF["buffer / capacity / offset<br/>logger / status"]
+    end
 
-### IR - WASM opcode mapping
+    BYTES["WASM byte buffer"]
+    CB["bal_wasm_callback_t"]
+    CSW["Compiler Shared Worker<br/>WebAssembly.compile()"]
 
-The Ballistic IR uses scope-based structured control flow. This maps
-almost 1:1 to WASM's block/loop/if model with no Relooper required.
-
-| Ballistic IR       | WASM emission                          |
-|--------------------|----------------------------------------|
-| OPCODE_IF          | if (void type) + depth push            |
-| OPCODE_LOOP        | loop (void type) + depth push          |
-| OPCODE_BREAK       | br depth_to_enclosing_block            |
-| OPCODE_CONTINUE    | br depth_to_loop_header                |
-| OPCODE_MERGE       | end + local.set merged SSA local       |
-| OPCODE_END_BLOCK   | end                                    |
-| OPCODE_YIELD       | local.get - pushes value for MERGE     |
-| OPCODE_ADD         | local.get src1, local.get src2, i64.add, local.set dst |
-| OPCODE_LOAD        | local.get addr, i64.load 3 0           |
-| OPCODE_STORE       | local.get addr, local.get src, i64.store 3 0 |
-| OPCODE_CONST       | i64.const from constant_pool[idx]      |
-| OPCODE_RETURN      | return                                 |
-| OPCODE_NOP         | nop (or skip entirely)                 |
-
-### SSA - WASM locals
-
-Strict SSA maps directly to WASM locals via implicit indexing:
-
-    ssa_index N - wasm local N
-
-No register allocator needed. The WASM function declares
-instruction_count locals at the top - types derived from ssa_bit_widths[].
-A pre-scan of the IR block before emission determines the local count.
-
-### Constant operands
-
-When Bit[16] of an operand is set it is a constant pool index not an SSA index:
-
-    if (operand & (1u << 16)) {
-        // emit i64.const constant_pool[operand & 0xFFFF]
-    } else {
-        // emit local.get operand
-    }
-
-### Extension instructions
-
-OPCODE_ARG_EXTENSION must be physically contiguous to its parent instruction.
-The emission loop looks ahead when it encounters an extension instruction and
-collects all arguments before emitting anything for the parent.
+    ARM --> DEC
+    DEC --> DISPATCH
+    DISPATCH --> EMIT
+    EMIT --> BUF
+    BUF --> BYTES
+    BYTES --> CB
+    CB --> CSW
+```
 
 ### WASM module structure per compiled block
 
-Each compiled ARM block becomes one WASM module with a fixed layout:
+```mermaid
+flowchart TD
+    MAGIC["magic + version<br/>0x00 0x61 0x73 0x6D 0x01 0x00 0x00 0x00"]
+    TYPES["type section<br/>1 function type"]
+    IMPORTS["import section<br/>1 import: env.memory<br/>(no function imports)"]
+    FUNCS["function section"]
+    EXPORTS["export section<br/>1 export: 'entry'"]
 
-    magic + version
-    type section    - one function type: () - void
-    import section  - memory, read_reg, write_reg, call_hle
-    function section
-    export section  - "entry" function 0
-    code section    - locals declaration + translated body
+    subgraph Code["code section"]
+        BODY["function body"]
+        LOCALS["locals declaration<br/>(patched: local_count)"]
+        INSTR["instruction body<br/>(emitted during single pass)"]
+        FEND["end byte"]
+    end
 
-The entry export is the only export. The CPU Worker caches it by guest
-address and calls it directly on subsequent executions.
+    MEND["end byte"]
+
+    MAGIC --> TYPES
+    TYPES --> IMPORTS
+    IMPORTS --> FUNCS
+    FUNCS --> EXPORTS
+    EXPORTS --> Code
+    BODY --> LOCALS
+    LOCALS --> INSTR
+    INSTR --> FEND
+    Code --> MEND
+```
+
+The "no imports" rule applies to **function** imports only — the linear memory import is required to share state with the host and is the single permitted import. The register file lives in linear memory at a known offset (chosen larger than any reachable guest address).
+
+### IR → WASM opcode mapping (current Tier 1 scope)
+
+| Ballistic IR | WASM emission |
+|---|---|
+| `OPCODE_ADD` (i32) | `local.get src1`, `local.get src2`, `i32.add`, `local.set dst` |
+| `OPCODE_ADD` (i64) | `local.get src1`, `local.get src2`, `i64.add`, `local.set dst` |
+| `OPCODE_LOAD` | `local.get addr`, `iN.load align=0 offset=0` |
+| `OPCODE_STORE` | `local.get addr`, `local.get src`, `iN.store align=0 offset=0` |
+| `OPCODE_CONST` | `iN.const`, write to register-file slot |
+| `OPCODE_RETURN` | (depends on function signature decision; see WASM_BACKEND_DESIGN_DOC.md) |
+| `OPCODE_NOP` | (skip entirely) |
+
+Width is semantic. `bal_wasm_emit_iN_*` exists in both 32-bit and 64-bit variants for every value-producing operation; the compiler emits the variant matching the SSA value's width per `ssa_bit_widths[]`. Width-conversion ops (`i64.extend_i32_u`, `i32.wrap_i64`) handle ARM's W↔X register transitions.
+
+### Future: scope-based control flow
+
+When OPCODE_IF, OPCODE_LOOP, OPCODE_BREAK, OPCODE_CONTINUE, OPCODE_MERGE, and OPCODE_YIELD ship in the IR layer, Ballistic's scope-based control flow maps almost 1:1 to WASM block/loop/if without requiring the Relooper algorithm:
+
+| IR | WASM |
+|---|---|
+| OPCODE_IF | `if (void)` + depth push |
+| OPCODE_LOOP | `loop (void)` + depth push |
+| OPCODE_BREAK | `br depth_to_enclosing_block` |
+| OPCODE_CONTINUE | `br depth_to_loop_header` |
+| OPCODE_MERGE | `end` + `local.set` merged-SSA local |
+
+The emission loop maintains a parallel scope stack alongside Ballistic's `block_scope_stack[]` to track WASM block nesting depth.
 
 ### The platform callback
 
-wasm_module_finalise() hands the completed bytes to a platform-provided
-callback. The backend does not know or care what happens to the bytes:
+`wasm_module_finalise()` hands the completed bytes to a platform-provided callback. The backend doesn't know or care what happens to the bytes:
 
-    typedef void (*wasm_compile_callback_t)(
-        uint64_t       guest_address,
-        const uint8_t* wasm_bytes,
-        size_t         byte_count,
-        void*          userdata
-    );
+```c
+typedef void (*wasm_compile_callback_t)(
+    uint64_t       guest_address,
+    const uint8_t* wasm_bytes,
+    size_t         byte_count,
+    void*          userdata
+);
+```
 
-Web:     posts bytes to Compiler Shared Worker - WebAssembly.compile()
-Desktop: passes to Wasmtime or stub
-Xbox:    passes to UWP WASM runtime
+| Platform | What the callback does |
+|---|---|
+| Web | Posts bytes to Compiler Shared Worker → `WebAssembly.compile()` |
+| Desktop (testing) | Passes to Wasmtime or stub |
+| Xbox | Passes to UWP WASM runtime |
 
-### Scope depth tracking
-
-The emission loop maintains a parallel scope stack alongside Ballistic's
-block_scope_stack[]. Each frame tracks the WASM block nesting depth at
-entry so BREAK and CONTINUE emit br instructions with correct depth indices:
-
-    typedef struct {
-        uint32_t wasm_depth;
-        uint32_t scope_type;   // IF or LOOP
-        uint32_t yield_local;  // WASM local where MERGE result lands
-    } WasmScopeFrame;
-
-    WasmScopeFrame wasm_scope_stack[64]; // matches block_scope_stack depth limit
+---
 
 ## 8. HLE Service Layer
 
@@ -1017,7 +1118,37 @@ entry so BREAK and CONTINUE emit br instructions with correct depth indices:
 
 HLE (High Level Emulation) intercepts Switch OS syscalls and implements them directly in the emulator host rather than running Switch OS code. This is how all Switch emulators operate.
 
-### Syscall dispatch
+### Syscall dispatch flow
+
+```mermaid
+flowchart LR
+    GUEST["Guest code<br/>SVC instruction"]
+    BACKEND["Active CPU backend<br/>(invokes svc_handler)"]
+    DISPATCH["hle_on_svc()<br/>read X8 = syscall ID<br/>switch on syscall ID"]
+
+    subgraph Handlers["Syscall handlers"]
+        MEM["Memory<br/>(SetHeapSize, MapMemory, ...)"]
+        THR["Threading<br/>(CreateThread, Sleep, ...)"]
+        IPC["IPC<br/>(ConnectToNamedPort,<br/>SendSyncRequest)"]
+        SYNC["Synchronisation<br/>(WaitSync, ArbitrateLock)"]
+        H["Handles<br/>(CloseHandle)"]
+        I["Info<br/>(GetInfo)"]
+    end
+
+    SERVICES["Services<br/>(sm:, fsp-srv, hid:,<br/>nvdrv:, audio:, time:, ...)"]
+
+    GUEST --> BACKEND
+    BACKEND --> DISPATCH
+    DISPATCH --> MEM
+    DISPATCH --> THR
+    DISPATCH --> IPC
+    DISPATCH --> SYNC
+    DISPATCH --> H
+    DISPATCH --> I
+    IPC --> SERVICES
+```
+
+### Implementation
 
 ```c
 // core/hle/hle.c
@@ -1077,7 +1208,6 @@ void hle_on_svc(CPU_State* cpu_state, uint32_t swi, void* userdata) {
 ```c
 // core/hle/hle.h
 
-// Switch OS result codes
 #define HLE_RESULT_SUCCESS              0x00000000
 #define HLE_RESULT_NOT_IMPLEMENTED      0xF601
 #define HLE_RESULT_INVALID_HANDLE       0xE401
@@ -1088,7 +1218,7 @@ void hle_on_svc(CPU_State* cpu_state, uint32_t swi, void* userdata) {
 
 typedef struct {
   uint32_t    error_code;
-  const char* result_name;   // static string, for logging
+  const char* result_name;
   bool        was_successful;
 } HLE_ServiceResult;
 
@@ -1107,16 +1237,22 @@ typedef struct {
 
 Games will not boot past the first frame without these, in order:
 
-1. **`sm:`** (service manager), all other services connect through this
-2. **Memory SVCs**, SetHeapSize, QueryMemory, MapMemory, UnmapMemory
-3. **IPC**, ConnectToNamedPort, SendSyncRequest
-4. **Threading**, CreateThread, StartThread, SleepThread, WaitSynchronization
-5. **`fsp-srv`**, filesystem, RomFS, save data access
-6. **`nvdrv:`**, NVIDIA GPU driver, command buffer submission
-7. **`appletOE` / `appletAE`**, application lifecycle, focus management
-8. **`hid:`**, controller and input
-9. **`audio:`**, IAudioDevice, IAudioRenderer
-10. **`time:`**, IStaticService (many games call this early)
+1. **`sm:`** (service manager) — all other services connect through this
+2. **Memory SVCs** — SetHeapSize, QueryMemory, MapMemory, UnmapMemory
+3. **IPC** — ConnectToNamedPort, SendSyncRequest
+4. **Threading** — CreateThread, StartThread, SleepThread, WaitSynchronization
+5. **`fsp-srv`** — filesystem, RomFS, save data access (operates on pre-decrypted NCA per §1.6)
+6. **`nvdrv:`** — NVIDIA GPU driver, command buffer submission
+7. **`appletOE` / `appletAE`** — application lifecycle, focus management
+8. **`hid:`** — controller and input
+9. **`audio:`** — IAudioDevice, IAudioRenderer
+10. **`time:`** — IStaticService (many games call this early)
+
+### Loader subsystem note
+
+Per §1.6, `core/hle/loader/` operates on pre-decrypted NCA only. The loader parses RomFS, ExeFS, and npdm structures from already-decrypted input. It does not implement Nintendo's key-derivation scheme, does not consume prod.keys for content decryption, and does not handle encrypted NSP/XCI containers.
+
+When the loader receives a file it cannot open as decrypted NCA, it returns an error directing the user to decrypt using separate tools (hactool, nxdumptool) — see `docs/DUMPING.md` for the user workflow.
 
 ---
 
@@ -1124,37 +1260,71 @@ Games will not boot past the first frame without these, in order:
 
 ### Pipeline overview
 
+```mermaid
+flowchart TD
+    GAME["Game code"]
+    NV["nvdrv HLE service<br/>(command buffer submission)"]
+    PARSE["GPU command buffer parser"]
+    DISP{"Engine<br/>dispatch"}
+    E2D["2D engine"]
+    E3D["3D engine<br/>(Kepler/Maxwell)"]
+    EC["Compute engine"]
+
+    DECOMP["Maxwell shader<br/>decompiler<br/>(PTX → backend IR)"]
+    SHB{"Shader<br/>backend"}
+    WGSL["WGSL<br/>(WebGPU)"]
+    GLSL["GLSL<br/>(Vulkan)"]
+    MSL["MSL<br/>(Metal)"]
+    HLSL["HLSL<br/>(D3D12)"]
+
+    DRAW["GPU backend draw calls"]
+    FB["Framebuffer<br/>(SharedArrayBuffer)"]
+    GPU_W["GPU Worker"]
+    UP["Upload to GPUTexture"]
+    QP["Fullscreen quad render pass"]
+    OFF["OffscreenCanvas present"]
+
+    GAME --> NV
+    NV --> PARSE
+    PARSE --> DISP
+    DISP --> E2D
+    DISP --> E3D
+    DISP --> EC
+    E3D --> DECOMP
+    DECOMP --> SHB
+    SHB --> WGSL
+    SHB --> GLSL
+    SHB --> MSL
+    SHB --> HLSL
+    WGSL --> DRAW
+    GLSL --> DRAW
+    MSL --> DRAW
+    HLSL --> DRAW
+    DRAW --> FB
+    FB --> GPU_W
+    GPU_W --> UP
+    UP --> QP
+    QP --> OFF
 ```
-Game code
-  - nvdrv HLE service (command buffer submission)
-  - GPU command buffer parser
-  - Engine dispatch (2D / 3D / Compute)
-  - Maxwell shader decompiler (PTX - backend IR)
-  - Shader backend (WGSL / GLSL / MSL / HLSL)
-  - GPU backend draw calls
-  - Framebuffer written to SharedArrayBuffer
-  - GPU Worker reads framebuffer
-  - Upload to GPUTexture
-  - Fullscreen quad render pass
-  - OffscreenCanvas present
-```
 
-### Shader strategy, hybrid uber-shader + JIT
+### Shader strategy: hybrid uber-shader + JIT
 
-```
-Shader encounter (first time)
-  - Select uber-shader variant matching current Maxwell state
-  - Render frame immediately with uber-shader (zero compile latency)
-  - Simultaneously begin JIT shader compilation async
+```mermaid
+sequenceDiagram
+    participant Game
+    participant GPU as GPU subsystem
+    participant Uber as Uber-shader
+    participant JIT as JIT shader compile
 
-JIT shader compilation complete
-  - Swap uber-shader out for optimised JIT shader
-  - Uber-shader variant discarded for this material state
+    Game->>GPU: First encounter of shader state S
+    GPU->>Uber: Select uber-shader variant matching S
+    Uber-->>GPU: Render frame immediately<br/>(zero compile latency)
+    GPU->>JIT: Begin async JIT compile of S
+    Note over Game,Uber: Frames continue rendering via<br/>uber-shader (slightly reduced<br/>GPU efficiency, no frame drops)
 
-Performance trade-off:
-  Uber-shader period: slightly reduced GPU efficiency
-  JIT shader period:  optimal GPU efficiency
-  Frame drops: zero (uber-shader always covers the gap)
+    JIT-->>GPU: Optimised JIT shader ready
+    GPU->>GPU: Swap uber-shader → JIT shader for state S
+    Note over Game,JIT: Subsequent frames use<br/>optimal JIT shader
 ```
 
 ```c
@@ -1169,16 +1339,24 @@ typedef enum GPU_ShaderStrategy {
 
 Maxwell uses ASTC texture compression. Not all target GPUs support ASTC natively.
 
-```
-Texture load
-  - Check WebGPU texture-compression-astc feature
-  - If supported: upload ASTC directly (zero cost)
-  - If not supported:
-      - Check OPFS transcode cache (keyed by texture hash)
-      - Cache hit: upload cached BC7/ETC2 directly
-      - Cache miss: compute shader transcode ASTC - BC7 (desktop) or ETC2 (mobile)
-                    write result to OPFS transcode cache
-                    upload to GPU
+```mermaid
+flowchart TD
+    LOAD["Texture load request"]
+    CHECK{"WebGPU<br/>texture-compression-astc<br/>feature available?"}
+    DIRECT["Upload ASTC directly<br/>(zero cost)"]
+    CACHE{"OPFS transcode<br/>cache hit?"}
+    UPCACHED["Upload cached BC7/ETC2<br/>directly"]
+    CS["Compute shader transcode<br/>ASTC → BC7 (desktop) or<br/>ETC2 (mobile)"]
+    WRITE["Write result to OPFS<br/>transcode cache"]
+    UPLOAD["Upload to GPU"]
+
+    LOAD --> CHECK
+    CHECK -->|yes| DIRECT
+    CHECK -->|no| CACHE
+    CACHE -->|hit| UPCACHED
+    CACHE -->|miss| CS
+    CS --> WRITE
+    WRITE --> UPLOAD
 ```
 
 ### GPU backend interface
@@ -1231,10 +1409,10 @@ extern const GPU_Backend GPU_BACKEND_D3D12;
 
 Switch 1 games capped at 30fps can be interpolated to 60fps using motion vectors already computed by the Maxwell 3D engine.
 
-- **Disabled by default**, adds one frame of input latency
+- **Disabled by default** — adds one frame of input latency
 - **User opt-in** with explicit warning about latency increase
-- **Suppressed on hard cuts**, per-frame metadata detects scene changes
-- **HUD elements excluded**, 2D overlay elements do not interpolate correctly
+- **Suppressed on hard cuts** — per-frame metadata detects scene changes
+- **HUD elements excluded** — 2D overlay elements do not interpolate correctly
 - Implementation: GPU Worker, WebCodecs VideoEncoder/Decoder
 
 ---
@@ -1243,19 +1421,18 @@ Switch 1 games capped at 30fps can be interpolated to 60fps using motion vectors
 
 ### Architecture
 
-```
-Maxwell DSP (HLE)
-  - Float32 sample generation
-  - Write to ring buffer (SharedArrayBuffer)
-  - Atomics.notify Audio Worker
+```mermaid
+flowchart LR
+    DSP["Maxwell DSP (HLE)<br/>Float32 sample generation"]
+    RB["Audio Ring Buffer<br/>(SharedArrayBuffer)"]
+    AW["Audio Worker<br/>(Atomics.wait when empty)"]
+    AWP["AudioWorkletProcessor<br/>(audio thread priority)"]
+    OUT["System audio output"]
 
-Audio Worker
-  - Atomics.wait when buffer empty
-  - Read Float32 samples from ring buffer
-  - Feed AudioWorkletProcessor
-
-AudioWorkletProcessor (audio thread priority)
-  - Output to system audio
+    DSP -->|"write samples,<br/>Atomics.notify"| RB
+    RB -->|"read samples"| AW
+    AW --> AWP
+    AWP --> OUT
 ```
 
 ### Ring buffer layout
@@ -1297,8 +1474,8 @@ extern const Audio_Backend AUDIO_BACKEND_PIPEWIRE;
 
 | Data | Storage | Reason |
 |---|---|---|
-| Game files (ROM/NSP/XCI) | `FileSystemDirectoryHandle` | User owns, never copy multi-GB into browser storage |
-| prod.keys / firmware | `FileSystemDirectoryHandle` | User owns, read once at startup |
+| Game files (decrypted NCA) | `FileSystemDirectoryHandle` | User owns, never copy multi-GB into browser storage |
+| prod.keys (if user supplies for save crypto only) | `FileSystemDirectoryHandle` | User owns; Voland never uses for content decryption per §1.6 |
 | Save data | OPFS | Emulator managed, fast I/O, explicit quota errors |
 | Shader cache | OPFS sync access handle (Worker) | Frequent small reads on render hot path |
 | Translation cache (PTC) | OPFS sync access handle (Worker) | Same as shader cache |
@@ -1309,7 +1486,43 @@ extern const Audio_Backend AUDIO_BACKEND_PIPEWIRE;
 | Amiibo .bin files | OPFS | Small, emulator managed |
 | Transcoded textures | OPFS | Keyed by texture hash, avoids re-transcoding |
 
-### Filesystem Access API, persistent handles
+### Storage tier overview
+
+```mermaid
+flowchart TD
+    USER["User's filesystem"]
+    FSAH["FileSystemDirectoryHandle<br/>(user-owned, persistent permission)"]
+    OPFS["OPFS<br/>(emulator-managed, sandboxed,<br/>quota-bound)"]
+    IDB["IndexedDB<br/>(small structured data)"]
+    SWM["Shared Worker memory<br/>(compatibility DB, cross-tab)"]
+
+    subgraph UD["User-owned data"]
+        GF["Decrypted NCA files"]
+        BIG_MODS["Large mod packs"]
+    end
+
+    subgraph EM["Emulator-managed data"]
+        SAVES["Save data"]
+        SHC["Shader cache"]
+        PTC["Translation cache (PTC)"]
+        TT["Transcoded textures"]
+        SM_MODS["Small mods"]
+        AB["Amiibo .bin files"]
+    end
+
+    subgraph META["Metadata"]
+        SET["Settings"]
+        CMETA["Cache validity<br/>(version, build_id, last_used)"]
+    end
+
+    USER --> FSAH
+    UD --> FSAH
+    EM --> OPFS
+    META --> IDB
+    SWM -.-> SWM
+```
+
+### Filesystem Access API: persistent handles
 
 ```typescript
 // platform/web/src/store/filesystem.ts
@@ -1320,8 +1533,8 @@ interface StoredHandles {
   readonly firmwareDirectory: FileSystemDirectoryHandle | null;
 }
 
-// Store handles in IndexedDB, permission survives page reload
-// User must re-confirm permission once per browser session
+// Store handles in IndexedDB; permission survives page reload.
+// User must re-confirm permission once per browser session.
 async function persistDirectoryHandle(
   key: string,
   handle: FileSystemDirectoryHandle
@@ -1352,7 +1565,7 @@ Shader and translation caches are binary blobs in OPFS. Their validity metadata 
 
 interface ShaderCacheMetadata {
   readonly titleId:        string;
-  readonly cacheVersion:   number;  // bump this constant on breaking IR changes
+  readonly cacheVersion:   number;  // bump on breaking IR changes
   readonly backendVersion: string;  // Ballistic semver
   readonly entryCount:     number;
   readonly lastUsedAt:     number;  // Date.now(), for LRU eviction
@@ -1377,6 +1590,25 @@ async function validateShaderCache(titleId: string): Promise<boolean> {
   return isValid;
 }
 ```
+
+### LRU eviction policy
+
+OPFS has a per-origin quota that varies by browser and storage pressure. Voland enforces a soft cap and evicts on quota errors:
+
+- **Soft cap:** 8 GB total OPFS usage across all caches
+- **Hard cap:** browser-imposed quota (typically 60% of available disk per origin)
+- **Eviction trigger:** OPFS write error with QuotaExceededError, or scheduled check at startup if usage > soft cap
+- **Eviction order:** by `lastUsedAt` ascending (oldest unused first), per-title
+- **Never evicts:** save data, settings, any user-supplied content
+
+### "Increase performance for others" toggle (per-user, local-only)
+
+Per §1.6, Voland operates no aggregation server. The toggle's behavior:
+
+- **Off (default):** Per-user JIT cache (PTC) writes to OPFS, evicted by LRU per above.
+- **On:** Per-user JIT cache writes to OPFS more aggressively (larger cap, less aggressive eviction). User can manually export their cache to a file via Settings; users can manually import a friend's exported cache via Settings.
+
+Voland never uploads cache data to any server. There is no "cloud cache." This is a deliberate scope decision per §1.6.
 
 ### OPFS sync access handle pattern
 
@@ -1415,7 +1647,7 @@ Cross-Origin-Opener-Policy: same-origin-allow-popups
 Cross-Origin-Embedder-Policy: require-corp
 ```
 
-`same-origin-allow-popups` rather than `same-origin`, allows OAuth popups to retain opener access.
+`same-origin-allow-popups` rather than `same-origin` allows OAuth popups to retain opener access.
 
 Set in hosting config AND re-injected by Service Worker on cached responses:
 
@@ -1435,6 +1667,43 @@ function addCrossOriginIsolationHeaders(response: Response): Response {
 ```
 
 ### Boot sequence
+
+```mermaid
+flowchart TD
+    START["main.ts boot()"]
+    COI{"crossOriginIsolated?"}
+    WGPU{"navigator.gpu<br/>available?"}
+    OPFS{"navigator.storage<br/>.getDirectory<br/>available?"}
+
+    ALLOC["Allocate SharedArrayBuffers:<br/>guestRAM (4GB)<br/>frameSync (4 bytes)<br/>audioRing (configurable)<br/>traceBuf (64KB+)"]
+
+    EXPOSE["Expose trace buffer for<br/>Chrome extension<br/>(window.__SWITCH_EMU_TRACE_BUFFER__)"]
+
+    CANVAS["Transfer canvas to<br/>OffscreenCanvas"]
+
+    MC["Create CPU↔GPU<br/>MessageChannel"]
+
+    WORKERS["Start workers:<br/>cpu.worker.ts<br/>gpu.worker.ts<br/>audio.worker.ts"]
+
+    SW["Register Service Worker"]
+    APP["Mount Solid.js app"]
+
+    FATAL["Show fatal error<br/>(specific cause)"]
+
+    START --> COI
+    COI -->|no| FATAL
+    COI -->|yes| WGPU
+    WGPU -->|no| FATAL
+    WGPU -->|yes| OPFS
+    OPFS -->|no| FATAL
+    OPFS -->|yes| ALLOC
+    ALLOC --> EXPOSE
+    EXPOSE --> CANVAS
+    CANVAS --> MC
+    MC --> WORKERS
+    WORKERS --> SW
+    SW --> APP
+```
 
 ```typescript
 // platform/web/src/main.ts
@@ -1471,7 +1740,7 @@ async function boot(): Promise<void> {
 
   // 4. Allocate shared memory
   const guestRAM  = new SharedArrayBuffer(4 * 1024 * 1024 * 1024); // 4GB
-  const frameSync = new SharedArrayBuffer(4);                        // Int32
+  const frameSync = new SharedArrayBuffer(4);                       // Int32
   const audioRing = new SharedArrayBuffer(AUDIO_RING_BYTE_SIZE);
   const traceBuf  = new SharedArrayBuffer(TRACE_BUFFER_BYTE_SIZE);
 
@@ -1507,9 +1776,7 @@ async function boot(): Promise<void> {
     [cpuSyncPort]
   );
 
-  audioWorker.postMessage(
-    { type: "init", audioRing }
-  );
+  audioWorker.postMessage({ type: "init", audioRing });
 
   // 9. Register Service Worker
   if ("serviceWorker" in navigator) {
@@ -1523,7 +1790,7 @@ async function boot(): Promise<void> {
 
 ### Routing
 
-Navigation API intercepts all client-side navigation. Service Worker serves `index.html` for all navigate requests, enables hard refresh at `/game/:titleId`.
+Navigation API intercepts all client-side navigation. Service Worker serves `index.html` for all navigate requests; this enables hard refresh at `/game/:titleId`.
 
 ```typescript
 // platform/web/src/router.ts
@@ -1561,7 +1828,7 @@ navigation.addEventListener("navigate", (event: NavigateEvent) => {
 ```typescript
 // platform/web/bindings/protocol.ts
 
-// Main thread - CPU Worker
+// Main thread → CPU Worker
 type MainToCPUMessage =
   | { type: "init";       guestRAM: SharedArrayBuffer; frameSync: SharedArrayBuffer;
                           audioRing: SharedArrayBuffer; traceBuf: SharedArrayBuffer;
@@ -1573,21 +1840,21 @@ type MainToCPUMessage =
   | { type: "save-state"; slot: number }
   | { type: "load-state"; slot: number };
 
-// CPU Worker - Main thread
+// CPU Worker → Main thread
 type CPUToMainMessage =
   | { type: "fps";         value: number }
   | { type: "game-loaded"; titleId: string; title: string }
   | { type: "error";       message: string }
   | { type: "halted" };
 
-// Main thread - GPU Worker
+// Main thread → GPU Worker
 type MainToGPUMessage =
   | { type: "init";        canvas: OffscreenCanvas; guestRAM: SharedArrayBuffer;
                            frameSync: SharedArrayBuffer; traceBuf: SharedArrayBuffer;
                            port: MessagePort }
   | { type: "resize";      width: number; height: number };
 
-// CPU Worker - Compiler Shared Worker
+// CPU Worker → Compiler Shared Worker
 type CPUToCompilerMessage = {
   readonly requestId:  number;       // for matching responses
   readonly titleId:    string;       // for OPFS cache key namespacing
@@ -1595,7 +1862,7 @@ type CPUToCompilerMessage = {
   readonly armBytes:   Uint8Array;   // ARM instruction bytes to compile
 };
 
-// Compiler Shared Worker - CPU Worker
+// Compiler Shared Worker → CPU Worker
 type CompilerToCPUMessage =
   | { readonly requestId: number; readonly address: number; readonly module: WebAssembly.Module }
   | { readonly requestId: number; readonly address: number; readonly error: string };
@@ -1607,16 +1874,16 @@ type CompilerToCPUMessage =
 // platform/web/src/capabilities.ts
 
 interface PlatformCapabilities {
-  readonly webGPU:                 boolean;
-  readonly opfs:                   boolean;
-  readonly sharedArrayBuffer:      boolean;
-  readonly filesystemAccessApi:    boolean;
-  readonly webHID:                 boolean;
-  readonly webNFC:                 boolean;
-  readonly webCodecs:              boolean;
-  readonly computePressure:        boolean;
-  readonly screenWakeLock:         boolean;
-  readonly vibration:              boolean;
+  readonly webGPU:              boolean;
+  readonly opfs:                boolean;
+  readonly sharedArrayBuffer:   boolean;
+  readonly filesystemAccessApi: boolean;
+  readonly webHID:              boolean;
+  readonly webNFC:              boolean;
+  readonly webCodecs:           boolean;
+  readonly computePressure:     boolean;
+  readonly screenWakeLock:      boolean;
+  readonly vibration:           boolean;
 }
 
 function detectCapabilities(): PlatformCapabilities {
@@ -1640,8 +1907,8 @@ function detectCapabilities(): PlatformCapabilities {
 ```typescript
 // platform/web/sw.ts
 
-const SHELL_CACHE_NAME   = "shell-v1";
-const WASM_CACHE_NAME    = "wasm-v1";
+const SHELL_CACHE_NAME = "shell-v1";
+const WASM_CACHE_NAME  = "wasm-v1";
 
 const SHELL_ASSETS = [
   "/",
@@ -1674,7 +1941,7 @@ self.addEventListener("activate", (event: ExtendableEvent) => {
 self.addEventListener("fetch", (event: FetchEvent) => {
   const url = new URL(event.request.url);
 
-  // Navigate requests - always serve index.html (enables client-side routing)
+  // Navigate requests, always serve index.html (enables client-side routing)
   if (event.request.mode === "navigate") {
     event.respondWith(
       caches.match("/index.html").then(cached => {
@@ -1734,11 +2001,11 @@ self.addEventListener("fetch", (event: FetchEvent) => {
 
 ## 13. Native Platform Layers
 
-All native platforms link the C core directly. No IPC between UI and core, function calls through the CPU/GPU/Audio backend vtables.
+All native platforms link the C core directly. No IPC between UI and core — function calls through the CPU/GPU/Audio backend vtables.
 
 ### Platform matrix
 
-| Platform | UI | Renderer | Audio | JIT | Distribution |
+| Platform | UI | Renderer | Audio | JIT path | Distribution |
 |---|---|---|---|---|---|
 | Web | Solid.js | WebGPU | Web Audio | WASM bytecode | URL / PWA |
 | iOS | SwiftUI | Metal | CoreAudio | Requires `dynamic-codesigning` entitlement | Sideload (AltStore) |
@@ -1760,7 +2027,7 @@ Without `dynamic-codesigning`:
 
 With `dynamic-codesigning` (sideloaded builds only):
 - Full WASM JIT performance
-- Apple can revoke this path via policy change, document the risk
+- Apple can revoke this path via policy change — see §24 Risk Register
 
 ```xml
 <!-- ios/Entitlements.plist, sideload build only -->
@@ -1772,7 +2039,7 @@ With `dynamic-codesigning` (sideloaded builds only):
 
 Xbox runs locked-down Windows but Microsoft officially supports Developer Mode for $20 one-time fee. Any Xbox owner can sideload UWP apps. This is the only gaming console with an official legitimate sideload path.
 
-D3D12 on Xbox is the best-optimised GPU backend in the matrix, the console OS is built around it.
+D3D12 on Xbox is the best-optimised GPU backend in the matrix — the console OS is built around it.
 
 ---
 
@@ -1782,10 +2049,31 @@ D3D12 on Xbox is the best-optimised GPU backend in the matrix, the console OS is
 
 Input is collected on the main thread (only place these APIs work) and forwarded to the CPU Worker each frame:
 
+```mermaid
+flowchart LR
+    GP["Gamepad API<br/>(navigator.getGamepads)"]
+    KB["Keyboard /<br/>pointer events"]
+    HID["WebHID<br/>(Joy-Con, Pro Controller)"]
+    NFC["WebNFC<br/>(physical amiibo,<br/>Chrome Android only)"]
+
+    MAIN["Main thread<br/>(input collection)"]
+    CPU["CPU Worker<br/>(receives postMessage<br/>each frame)"]
+    HLE_HID["hid: HLE service"]
+    HLE_NFC["nfc: HLE service"]
+
+    GP --> MAIN
+    KB --> MAIN
+    HID --> MAIN
+    NFC --> MAIN
+    MAIN -->|"postMessage<br/>each rAF"| CPU
+    CPU --> HLE_HID
+    CPU --> HLE_NFC
+```
+
+### Gamepad polling
+
 ```typescript
 // platform/web/src/input.ts
-
-const GAMEPAD_POLL_INTERVAL_MS = 0; // poll every rAF, Gamepad API is poll-based
 
 function startInputLoop(cpuWorker: Worker): void {
   function poll(): void {
@@ -1810,13 +2098,13 @@ function startInputLoop(cpuWorker: Worker): void {
 
 ### Controller button mapping
 
-Switch button layout differs from Xbox layout, A/B and X/Y are swapped:
+Switch button layout differs from Xbox layout — A/B and X/Y are swapped:
 
 ```typescript
 // platform/web/src/input-mapping.ts
 
 interface ControllerProfile {
-  readonly name:    string;
+  readonly name:      string;
   readonly vendorId?: number;
   readonly productId?: number;
   // Maps Switch HID button index to Gamepad API button index
@@ -1827,8 +2115,8 @@ interface ControllerProfile {
 const STANDARD_MAPPING: ControllerProfile = {
   name:      "Standard",
   buttonMap: [
-    1, 0,  // A-B, B-A (swap)
-    3, 2,  // X-Y, Y-X (swap)
+    1, 0,  // A↔B (swap)
+    3, 2,  // X↔Y (swap)
     4, 5,  // L, R
     6, 7,  // ZL, ZR
     8, 9,  // Minus, Plus
@@ -1860,7 +2148,6 @@ const JOY_CON_HID_FILTERS = [
 
 async function requestJoyConAccess(): Promise<HIDDevice[]> {
   if (!("hid" in navigator)) return []; // not available, skip silently
-
   return navigator.hid.requestDevice({ filters: [...JOY_CON_HID_FILTERS] });
 }
 
@@ -1911,12 +2198,20 @@ async function scanPhysicalAmiibo(
 
 ### LayeredFS
 
-```
-Game requests /romfs/actor/Link.bfres
-  - Check OPFS mod layer (priority ordered):
-      /mods/{titleId}/mod-a/romfs/actor/Link.bfres  - found? return it
-      /mods/{titleId}/mod-b/romfs/actor/Link.bfres  - found? return it
-  - Not found in any mod: return base game file from RomFS
+```mermaid
+flowchart TD
+    REQ["Game requests<br/>/romfs/actor/Link.bfres"]
+
+    M_A["Check OPFS:<br/>/mods/{titleId}/mod-a/<br/>romfs/actor/Link.bfres"]
+    M_B["Check OPFS:<br/>/mods/{titleId}/mod-b/<br/>romfs/actor/Link.bfres"]
+    BASE["Read from base game<br/>RomFS"]
+
+    REQ -->|priority 1| M_A
+    M_A -->|miss| M_B
+    M_B -->|miss| BASE
+    M_A -->|hit| RET["Return file"]
+    M_B -->|hit| RET
+    BASE --> RET
 ```
 
 ### Mod metadata
@@ -1945,7 +2240,7 @@ interface ModMetadata {
 | `.7z` | libarchive.wasm | WASM build of libarchive |
 | `.rar` | libarchive.wasm | Same build |
 
-Extract to OPFS on install. Large mod packs (>500MB) kept as Filesystem Access API handles and read directly, never copy to OPFS.
+Extract to OPFS on install. Large mod packs (>500MB) kept as Filesystem Access API handles and read directly — never copy to OPFS.
 
 ---
 
@@ -1955,19 +2250,24 @@ Extract to OPFS on install. Large mod packs (>500MB) kept as Filesystem Access A
 
 WebRTC DataChannel with unreliable transport (UDP semantics) to match the Switch LDN protocol latency profile.
 
-```
-Player A (host)                 Signalling Server               Player B (guest)
-  │                                     │                              │
-  │ POST /rooms { titleId } >│                              │
-  │< { roomCode: "ABC123" } │                              │
-  │                                     │< POST /rooms/ABC123/join │
-  │< WebRTC offer │                              │
-  │ WebRTC answer >│>│
-  │<══════════════════ ICE exchange ════════════════════════════════>│
-  │<══════════════ P2P DataChannel established ══════════════════════>│
-  │                                     │                              │
-  (signalling server is now out of path)
-  │<══════════════ LDN packets over DataChannel ════════════════════>│
+```mermaid
+sequenceDiagram
+    participant A as Player A (host)
+    participant S as Signalling Server
+    participant B as Player B (guest)
+
+    A->>S: POST /rooms { titleId }
+    S-->>A: { roomCode: "ABC123" }
+    B->>S: POST /rooms/ABC123/join
+    S->>A: Player B wants to join
+    A-->>S: WebRTC offer
+    S-->>B: Offer
+    B-->>S: WebRTC answer
+    S-->>A: Answer
+    Note over A,B: ICE exchange via signalling
+    A<<->>B: P2P DataChannel established
+    Note over S: Signalling out of path
+    A<<->>B: LDN packets over DataChannel
 ```
 
 ### LDN packet interception
@@ -1975,7 +2275,7 @@ Player A (host)                 Signalling Server               Player B (guest)
 ```c
 // core/hle/services/network/ldn.c
 
-// Intercept at LDN service boundary, game never knows it's not on local WiFi
+// Intercept at LDN service boundary; game never knows it's not on local WiFi
 void ldn_on_send_packet(LDN_Context* ctx,
                          const void*  packet_data,
                          size_t       packet_size,
@@ -2018,7 +2318,7 @@ async function handleIceConnectionFailure(
 }
 ```
 
-Users can configure their own TURN server credentials in Settings. Recommended self-hosted TURN: Coturn (github.com/coturn/coturn).
+Users can configure their own TURN server credentials in Settings. Recommended self-hosted TURN: Coturn ([github.com/coturn/coturn](https://github.com/coturn/coturn)).
 
 ---
 
@@ -2040,7 +2340,7 @@ async function injectAmiiboFromFile(
   });
 }
 
-// Virtual amiibo from public amiibo API, generates correct .bin format
+// Virtual amiibo from public amiibo API; generates correct .bin format
 async function injectVirtualAmiibo(
   cpuWorker: Worker,
   amiiboId: string
@@ -2053,11 +2353,23 @@ async function injectVirtualAmiibo(
 }
 ```
 
-### NFC HLE service
+### NFC HLE service flow
 
-When a game calls the NFC service requesting a tag scan, the HLE NFC service checks for injected tag data and responds immediately, the game never knows there is no physical amiibo.
+```mermaid
+flowchart TD
+    GAME["Game calls NFC service<br/>requesting tag scan"]
+    HLE["NFC HLE service"]
+    INJ{"Injected tag<br/>data present?"}
+    PHYS{"Physical scan<br/>via WebNFC<br/>requested?"}
+    RES["Return tag data<br/>to game"]
 
-Physical amiibo scanning via WebNFC (Chrome Android only) is handled in input.ts and feeds into the same injection path.
+    GAME --> HLE
+    HLE --> INJ
+    INJ -->|yes| RES
+    INJ -->|no| PHYS
+    PHYS -->|"scan succeeds<br/>(Chrome Android)"| RES
+    PHYS -->|"unavailable or<br/>cancelled"| EMPTY["Return 'no tag' to game"]
+```
 
 ---
 
@@ -2071,14 +2383,14 @@ A lightweight app for phone/watch that communicates with the running emulator vi
 |---|---|---|---|
 | Game status / FPS | ✓ | ✓ | ✓ |
 | Remote controller input | ✓ (limited) | ✓ | ✓ |
-| Save state management |, | ✓ | ✓ |
-| Secondary display (touchscreen) |, | ✓ | ✓ |
-| Screenshot gallery |, | ✓ | ✓ |
-| Mod management |, | ✓ | ✓ |
+| Save state management | — | ✓ | ✓ |
+| Secondary display (touchscreen) | — | ✓ | ✓ |
+| Screenshot gallery | — | ✓ | ✓ |
+| Mod management | — | ✓ | ✓ |
 
 ### Secondary display
 
-The Switch uses its touchscreen as a secondary display in some games (inventory, maps, item management). The companion app can display this content by receiving the secondary framebuffer region from the emulator over the WebSocket connection, the same region the Switch would render to its touchscreen.
+The Switch uses its touchscreen as a secondary display in some games (inventory, maps, item management). The companion app can display this content by receiving the secondary framebuffer region from the emulator over the WebSocket connection — the same region the Switch would render to its touchscreen.
 
 ---
 
@@ -2092,7 +2404,7 @@ The Switch uses its touchscreen as a secondary display in some games (inventory,
 // 24 bytes per event, fits 2730 events per 64KB page
 typedef struct __attribute__((packed)) Trace_Event {
   uint64_t timestamp_ns;   // Atomics-safe monotonic timestamp
-  uint32_t event_type;     // TRACE_SVC, TRACE_GPU_CMD, TRACE_AUDIO_UNDERRUN, etc
+  uint32_t event_type;     // TRACE_SVC, TRACE_GPU_CMD, TRACE_AUDIO_UNDERRUN, ...
   uint32_t thread_id;      // which worker emitted this
   uint32_t payload[2];     // event-type-specific data
 } Trace_Event;
@@ -2124,14 +2436,37 @@ window.__SWITCH_EMU_BREAKPOINT_BUF__ = breakpointBuf; // SharedArrayBuffer
 window.__SWITCH_EMU_HALT_FLAG__      = haltFlag;       // SharedArrayBuffer
 ```
 
-The Chrome extension reads the trace buffer out-of-process, directly from the SharedArrayBuffer, without any involvement from the emulator's main thread, CPU Worker, GPU Worker, or any emulator code. Zero overhead on the emulator during profiling.
+### Out-of-process profiling
+
+```mermaid
+flowchart LR
+    subgraph EmuTab["Emulator tab"]
+        CPU_W["CPU Worker"]
+        GPU_W["GPU Worker"]
+        AUD_W["Audio Worker"]
+        TB["Trace Buffer<br/>(SharedArrayBuffer)"]
+    end
+
+    subgraph ExtCtx["Chrome Extension<br/>(out-of-process)"]
+        EXT["Extension content script"]
+        UI_T["Timeline UI"]
+    end
+
+    CPU_W -->|trace_emit| TB
+    GPU_W -->|trace_emit| TB
+    AUD_W -->|trace_emit| TB
+    EXT -->|reads directly,<br/>zero overhead on emulator| TB
+    EXT --> UI_T
+```
+
+The Chrome extension reads the trace buffer out-of-process, directly from the SharedArrayBuffer, without any involvement from the emulator's main thread, CPU Worker, GPU Worker, or any emulator code. **Zero overhead on the emulator during profiling.**
 
 ### Hot-reload HLE (development builds only)
 
 ```cmake
 # CMakeLists.txt
 if(CMAKE_BUILD_TYPE STREQUAL "Debug" AND EMSCRIPTEN)
-  # Main module, dynamically loads side modules
+  # Main module dynamically loads side modules
   target_link_options(switch_core PRIVATE -s MAIN_MODULE=1)
 
   # Each HLE service as a reloadable side module
@@ -2186,7 +2521,7 @@ option(CMAKE_BUILD_TYPE "Debug|Release|RelWithDebInfo" "Debug")
 ```cmake
 if(EMSCRIPTEN)
   target_compile_options(switch_core PRIVATE
-    -msimd128                # REQUIRED, without this NEON - WASM SIMD fails, ~4x slowdown
+    -msimd128                # REQUIRED, without this NEON → WASM SIMD fails, ~4x slowdown
   )
 
   target_link_options(switch_core PRIVATE
@@ -2208,11 +2543,11 @@ endif()
 
 ```cmake
 # Web (requires Emscripten toolchain)
-# cmake -DCMAKE_TOOLCHAIN_FILE=$EMSDK/cmake/Modules/Platform/Emscripten.cmake
+# cmake -DCMAKE_TOOLCHAIN_FILE=$EMSDK/cmake/Modules/Platform/Emscripten.cmake \
 #       -DCPU_BACKEND=ballistic -DGPU_BACKEND=webgpu ..
 
 # Desktop (Linux/Windows/macOS)
-# cmake -DCPU_BACKEND=dynarmic -DGPU_BACKEND=auto ..
+# cmake -DCPU_BACKEND=ballistic -DGPU_BACKEND=auto ..
 
 # iOS/macOS/tvOS/visionOS, Xcode project generated
 # cmake -G Xcode -DCMAKE_SYSTEM_NAME=iOS ..
@@ -2228,7 +2563,25 @@ endif()
 
 ## 21. Development Phases
 
-### Phase 0, Skeleton
+### Overview
+
+```mermaid
+flowchart LR
+    P0["Phase 0<br/>Skeleton"]
+    P1["Phase 1<br/>Load &<br/>Attempt Execution"]
+    P2["Phase 2<br/>First<br/>Instructions"]
+    P3["Phase 3<br/>First<br/>Pixels"]
+    P4["Phase 4<br/>First<br/>Boot"]
+    P5["Phase 5<br/>Playable Core +<br/>Compat DB"]
+    P6["Phase 6<br/>System<br/>Features"]
+    P7["Phase 7<br/>Advanced<br/>Features"]
+    P8["Phase 8<br/>Platform<br/>Expansion"]
+    P9["Phase 9<br/>Ecosystem &<br/>Polish"]
+
+    P0 --> P1 --> P2 --> P3 --> P4 --> P5 --> P6 --> P7 --> P8 --> P9
+```
+
+### Phase 0 — Skeleton
 
 **Goal:** The emulator boots and runs a minimal loop with no real functionality.
 
@@ -2239,22 +2592,19 @@ endif()
 - [ ] Web scaffolding: CPU worker + SharedArrayBuffer allocation
 - [ ] Minimal boot sequence (app loads, workers start, logs visible)
 
----
+### Phase 1 — Load & Attempt Execution
 
-### Phase 1, Load & Attempt Execution
+**Goal:** A real (pre-decrypted) game file loads into memory and execution begins (even if it fails).
 
-**Goal:** A real game file loads into memory and execution begins (even if it fails).
-
-- [ ] NSP/XCI/NCA parsing (minimal, enough to load code)
+- [ ] Decrypted-NCA parsing (RomFS, ExeFS, npdm — no encryption handling per §1.6)
 - [ ] Load executable sections into guest memory
 - [ ] Memory HLE (SetHeapSize, MapMemory, basic virtual memory)
 - [ ] Minimal IPC + sm: service stub
-- [ ] Basic input (Gamepad API - CPU worker)
+- [ ] Basic input (Gamepad API → CPU worker)
 - [ ] Entry point execution attempt
+- [ ] User-facing error path for encrypted input pointing to dumping guide
 
----
-
-### Phase 2, First Instructions
+### Phase 2 — First Instructions
 
 **Goal:** Game code executes via interpreter.
 
@@ -2263,9 +2613,7 @@ endif()
 - [ ] Threading HLE (CreateThread, StartThread, SleepThread)
 - [ ] Basic IPC routing (fake responses acceptable)
 
----
-
-### Phase 3, First Pixels
+### Phase 3 — First Pixels
 
 **Goal:** Render the first visible frame (even if incorrect).
 
@@ -2275,35 +2623,30 @@ endif()
 - [ ] WebGPU renderer (texture upload + fullscreen quad)
 - [ ] Hardcoded / fallback rendering path (no full shader system)
 
----
-
-### Phase 4, First Boot
+### Phase 4 — First Boot
 
 **Goal:** A game reaches its title screen.
 
 - [ ] Expand nvdrv handling (just enough for boot)
 - [ ] Minimal shader handling or crude fallback
-- [ ] fsp-srv (filesystem, RomFS access)
+- [ ] fsp-srv (filesystem, RomFS access on decrypted input)
 - [ ] hid service (basic controller input)
 - [ ] applet services (lifecycle)
 - [ ] time service (basic responses)
 - [ ] Audio stub or minimal output
 
----
+### Phase 5 — Playable Core (+ Compatibility Database)
 
-### Phase 5, Playable Core
+**Goal:** At least one game runs at playable speed; users can know what works.
 
-**Goal:** At least one game runs at playable speed.
-
-- [ ] Integrate JIT backend (Dynarmic or early Ballistic)
+- [ ] Integrate JIT backend (Ballistic-x86 on desktop; interpreter on web until Ballistic-WASM ships)
 - [ ] Basic shader caching
 - [ ] Reduce CPU/GPU sync stalls
 - [ ] Expand HLE only as required for stability
 - [ ] Fix major crashes and correctness issues
+- [ ] **Compatibility database — first cut.** As soon as any game runs, users need a public list of "this game works / this doesn't / this hangs at scene X." Without the DB, every user files a duplicate "does X work?" issue.
 
----
-
-### Phase 6, System Features
+### Phase 6 — System Features
 
 **Goal:** Make the emulator usable for real users.
 
@@ -2312,39 +2655,35 @@ endif()
 - [ ] Basic frontend UI (library, settings)
 - [ ] Improved shader pipeline (incremental)
 - [ ] Basic texture handling (ASTC fallback if needed)
+- [ ] Compatibility DB integration into UI (per-title status visible in library)
 
----
-
-### Phase 7, Advanced Features
+### Phase 7 — Advanced Features
 
 **Goal:** Add non-essential functionality.
 
 - [ ] LayeredFS mod system
 - [ ] Amiibo support (OPFS + optional WebNFC)
-- [ ] Translation cache (PTC)
+- [ ] Translation cache (PTC) — local-only per §1.6
+- [ ] AOT pre-translation as opt-in advanced setting (per-game; user accepts long first-launch in exchange for reduced runtime stutter)
 - [ ] Improved audio accuracy
 
----
-
-### Phase 8, Platform Expansion
+### Phase 8 — Platform Expansion
 
 **Goal:** Port to additional platforms after stabilization.
 
-- [ ] Desktop (Windows / Linux / macOS)
-- [ ] Android
-- [ ] iOS (if viable)
+- [ ] Desktop (Windows / Linux / macOS) Qt/Cocoa wrappers
+- [ ] Android Jetpack Compose UI
+- [ ] iOS SwiftUI (if `dynamic-codesigning` path remains viable)
 
----
-
-### Phase 9, Ecosystem & Polish
+### Phase 9 — Ecosystem & Polish
 
 **Goal:** Power-user features and long-term polish.
 
 - [ ] WebRTC multiplayer (LDN)
-- [ ] Companion apps
-- [ ] Frame interpolation (optional)
-- [ ] Debug tooling (trace buffer UI)
-- [ ] Compatibility database
+- [ ] Companion apps (watchOS / iOS / Android)
+- [ ] Frame interpolation (optional, default off)
+- [ ] Debug tooling (trace buffer UI; Chrome extension)
+- [ ] Manual cache export/import for "Increase performance for others" toggle (no aggregation server)
 
 ---
 
@@ -2352,30 +2691,31 @@ endif()
 
 ### Starting point for new contributors
 
-**If you know TypeScript/JavaScript:** Start with the web platform layer. The CPU backend is a no-op stub, the entire frontend, storage layer, and worker architecture can be built and tested without any emulation knowledge. Begin with the boot sequence in `platform/web/src/main.ts` and work outward.
+**If you know TypeScript/JavaScript:** Start with the web platform layer. The CPU backend is a no-op stub; the entire frontend, storage layer, and worker architecture can be built and tested without any emulation knowledge. Begin with the boot sequence in `platform/web/src/main.ts` and work outward.
 
-**If you know C:** Start with the HLE service layer. Pick any unimplemented service from the priority list in section 8. Read the corresponding Ryujinx C# implementation as a reference for what the service needs to do. Reimplement it in C following the patterns in this document.
+**If you know C:** Start with the HLE service layer. Pick any unimplemented service from the priority list in section 8. Read the corresponding Ryubing C# implementation as a reference for what the service needs to do. Reimplement it in C following the patterns in this document.
 
-**If you know compiler engineering:** The most valuable contribution is the Ballistic WASM backend. Join the Pound Discord (discord.gg/aMmTmKsVC7) and raise the three IR design requirements from section 7 before contributing code. Offer to own the WASM backend implementation.
+**If you know compiler engineering:** The most valuable contribution is the Ballistic WASM backend. Join the Pound Discord ([discord.gg/aMmTmKsVC7](https://discord.gg/aMmTmKsVC7)) and engage on the IR design. The Ballistic repo's `docs/WASM_BACKEND_DESIGN_DOC.md` describes the current state.
 
 ### Code review requirements
 
 - No merge without tests for HLE services
-- No C++ in core (dynarmic wrapper excepted)
+- No C++ in core (dynarmic wrapper excepted; will be removed once Ballistic-x86 covers desktop)
 - No `any` in TypeScript
 - No third-party dependencies not listed in this document
 - All HLE services validated against known-good game output
+- **No code that decrypts Nintendo content. No code that operates server-side aggregation of user-derived data.** See §1.6.
 
 ### Reference implementations (read, do not fork)
 
 | Project | Language | What to study |
 |---|---|---|
-| Ryubing (github.com/Ryubing) | C# | HLE service implementations, what each service needs to do |
+| [Ryubing](https://github.com/Ryubing) | C# | HLE service implementations, what each service needs to do |
 | yuzu (archived) | C++ | GPU emulation approach, Maxwell command buffer format |
 | dynarmic | C++ | ARM instruction semantics, edge cases, test suite |
-| Emscripten Relooper | C++ | CFG - structured control flow reference implementation |
+| Emscripten Relooper | C++ | CFG → structured control flow reference (likely unneeded given Ballistic's scope-based IR) |
 
-Read their code to understand requirements. Reimplement in C targeting this architecture. Do not copy code, licensing and design incompatibilities.
+Read their code to understand requirements. Reimplement in C targeting this architecture. Do not copy code — licensing and design incompatibilities.
 
 ---
 
@@ -2383,19 +2723,11 @@ Read their code to understand requirements. Reimplement in C targeting this arch
 
 ### Ballistic (primary recompiler dependency)
 
-- Repository: github.com/pound-emu/ballistic
-- Discord: discord.gg/aMmTmKsVC7
+- Repository: [github.com/pound-emu/ballistic](https://github.com/pound-emu/ballistic)
+- Discord: [discord.gg/aMmTmKsVC7](https://discord.gg/aMmTmKsVC7)
 - Language: C
-- Status: Early development, basic arithmetic instructions
-- Contact: [GloriousTacoo](https://discord.com/users/1391478936961024157) on Discord
-
-Before contributing to Ballistic, read section 7 of this document and raise the three IR requirements on Discord. The window for influencing the IR design is now, before it solidifies.
-
-### Key IR design questions to raise on Pound Discord
-
-1. "Is the CFG being preserved as explicit block edges through to the backend, or flattened to jumps before emission?"
-2. "Are instruction results represented as SSA values or writes to a fixed register file?"
-3. "Is the backend interface a vtable of function pointers or compiled-in per build target?"
+- Status: Working barebones x86 backend in `src/backend/x86/`; WASM backend in design
+- Maintainer: [GloriousTacoo](https://github.com/GloriousTacoo)
 
 ### Nintendo Switch hardware reference
 
@@ -2410,24 +2742,48 @@ Before contributing to Ballistic, read section 7 of this document and raise the 
 
 ### ARM64 instruction reference
 
-ARM Architecture Reference Manual for A-profile: developer.arm.com/documentation/ddi0487
-ARM Cortex-A57 Technical Reference Manual: developer.arm.com/documentation/ddi0488
+- ARM Architecture Reference Manual for A-profile: [developer.arm.com/documentation/ddi0487](https://developer.arm.com/documentation/ddi0487)
+- ARM Cortex-A57 Technical Reference Manual: [developer.arm.com/documentation/ddi0488](https://developer.arm.com/documentation/ddi0488)
 
 ### WASM specification references
 
-- Binary format: webassembly.github.io/spec/core/binary
-- memory64 proposal: github.com/WebAssembly/memory64
-- SIMD proposal: github.com/WebAssembly/simd
-- Threads proposal: github.com/WebAssembly/threads
+- Binary format: [webassembly.github.io/spec/core/binary](https://webassembly.github.io/spec/core/binary)
+- memory64 proposal: [github.com/WebAssembly/memory64](https://github.com/WebAssembly/memory64)
+- SIMD proposal: [github.com/WebAssembly/simd](https://github.com/WebAssembly/simd)
+- Threads proposal: [github.com/WebAssembly/threads](https://github.com/WebAssembly/threads)
 
 ### WebGPU references
 
-- Specification: gpuweb.github.io/gpuweb
-- WGSL: gpuweb.github.io/gpuweb/wgsl
-- Fundamentals: webgpufundamentals.org
+- Specification: [gpuweb.github.io/gpuweb](https://gpuweb.github.io/gpuweb)
+- WGSL: [gpuweb.github.io/gpuweb/wgsl](https://gpuweb.github.io/gpuweb/wgsl)
+- Fundamentals: [webgpufundamentals.org](https://webgpufundamentals.org)
 
 ---
 
-*Document version: 1.0.0*
-*Last updated: April 2026*
+## 24. Risk Register
+
+This section names risks that could meaningfully impair or end the project. Some have mitigations; some don't. The point is to be deliberate about what's being signed up for.
+
+| Risk | Severity | Likelihood | Mitigation / Notes |
+|---|---|---|---|
+| Apple removes `dynamic-codesigning` entitlement for sideloaded apps | High | Low–medium | iOS/iPadOS/tvOS/visionOS lose JIT performance; fall back to interpreter-only on those platforms (likely too slow for AAA titles). Web platform unaffected. Native Apple ports become viewing-only or non-viable on AAA games until/unless Apple reverses. |
+| Nintendo legal action against the project | High | Medium | Voland's clean legal posture (no decryption per §1.6, no aggregated cache, no IP redistribution) puts the project on the safer side of the line that killed Yuzu/Citra and is pressuring Suyu. The risk is reduced but not zero — Nintendo can still send takedown requests against any Switch emulator. Maintainer should not host project on personal infrastructure. |
+| Suyu-style DMCA action specifically | High | Low (with §1.6 in place) | The Yuzu/Citra/Suyu legal theory (Section 1201 DMCA on circumvention of access controls) does not apply when the project never circumvents. §1.6 is the structural mitigation. Continued discipline is required: contributors will propose decryption-support patches; they must be rejected. |
+| Ballistic doesn't reach instruction coverage in time | Medium | Medium | CPU backend abstraction means Voland uses interpreter or dynarmic in the interim. JIT performance suffers but functionality remains. The project ships even if Ballistic stays minimal. |
+| WASM JIT compilation latency too high for usable performance | Medium | Medium | Tiered compilation: interpreter immediately, JIT in background. May produce visible stutter on first encounter of code blocks. AOT pre-translation in Phase 7 is the longer-term answer. |
+| WebGPU portability issues across browsers | Medium | Medium | Capability detection at boot; fail with clear error if WebGPU unavailable. Native platforms unaffected. Some games may render slightly differently across WebGPU implementations; acceptable until adoption matures. |
+| Browser memory limits make 4GB SharedArrayBuffer allocation fail | Medium | Low–medium | Detect at boot; fail with clear error message. No graceful degradation possible — Switch needs the address space. Affected users use native build instead. |
+| `Cross-Origin-Embedder-Policy: require-corp` breaks third-party assets | Medium | Medium | Only first-party assets allowed; document the constraint for users self-hosting. Service Worker injects required headers on cached responses. |
+| Maintainer burnout | Medium | Medium | Project is a multi-year effort. Variable-cadence contribution is acceptable. Phase plan is realistic, not aggressive. Contributor recruitment is part of Phase 5 onward, not deferred. |
+| ASTC texture transcoding compute shader bugs corrupt rendering | Low | Low | OPFS cache key includes transcoder version; cache invalidates on transcoder updates allowing forced rebuild. |
+| Service Worker COOP/COEP injection breaks on certain hosting setups | Low | Low | Documented in deployment notes; only affects self-hosting. Voland-hosted PWA always sets headers correctly. |
+| Reference-implementation language incompatibilities (Ryubing C# → C reimplementation) | Low | Medium | Reimplementation cost is real but well-understood. Contributors who can't engage with C# don't need to read Ryubing directly; design notes document service behavior. |
+| WebRTC LDN packet timing differs from WiFi LDN | Low–medium | High | Some latency-sensitive games (fighting games with frame-perfect inputs) may behave differently in multiplayer. Document as known limitation; not a project-killer. |
+
+The format of this register is "what could go wrong" — not "what will go wrong." Most rows are tolerable risks the project lives with, not show-stoppers. The two High-severity rows (Apple JIT entitlement, Nintendo legal action) are the genuine existential concerns.
+
+---
+
+*Document version: 2.0.0*
+*Last updated: May 2026*
 *Maintained by: proxy-alt*
