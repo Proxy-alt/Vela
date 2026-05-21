@@ -11,7 +11,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "solid-js": "^1.8.0"
+    "solid-js": "^1.9.13"
   },
   "devDependencies": {
     "@webgpu/types": "^0.1.69",
